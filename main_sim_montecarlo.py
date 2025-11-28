@@ -1,15 +1,15 @@
 # ----------------------------------------------------------------------------------
-# 脚本名称: main_sim_montecarlo.py (核心蒙特卡洛仿真 - 最终修复版 v4.2)
+# 脚本名称: main_sim_montecarlo.py (核心蒙特卡洛仿真 - 最终修复版 v4.1)
 #
 # 描述:
 #   本脚本是生成 IEEE TWC 论文核心图表 "Fig 6: RMSE vs SNR (The Error Floor)" 的主程序。
-#   修复了 toeplitz 函数的引用错误，并**增加了多进程死锁的鲁棒性**。
+#   修复了 toeplitz 函数的引用错误，确保在 Colab 环境中稳定运行。
 #
 # 核心功能与升级点:
-#   1. [鲁棒性增强]: 尝试设置 multiprocessing start method 为 'spawn'，防止 Colab 环境死锁。
+#   1. [错误修复]: 显式导入 scipy.linalg 解决 np.linalg.toeplitz 导致的 Traceback。
 #   2. [物理真值]: 使用 10GHz 宽带 DFS 信号作为 Ground Truth。
 #   3. [多级扫描]: 扫描不同 Jitter 强度，绘制 Error Floor 趋势。
-#   4. [CPU并行]: 使用 joblib 进行稳定高效的 CPU 多核并行加速 (增加 verbose 输出)。
+#   4. [CPU并行]: 使用 joblib 进行稳定高效的 CPU 多核并行加速。
 # ----------------------------------------------------------------------------------
 
 import numpy as np
@@ -68,7 +68,7 @@ def calc_bcrlb(snr_linear, jitter_cov_inv, h_sensitivity, scr=1.0):
     # 2. 热噪声信息量
     j_thermal = snr_linear * np.sum(h_sensitivity ** 2) * (scr ** 2)
 
-    return np.sqrt(1.0 / (j_jitter + J_thermal))
+    return np.sqrt(1.0 / (j_jitter + j_thermal))
 
 
 # --- 单次蒙特卡洛试验函数 ---
@@ -111,16 +111,6 @@ def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true
 
 
 def main():
-    # --- 修复: 尝试设置 multiprocessing start method ---
-    if multiprocessing.current_process().name == 'MainProcess' and multiprocessing.get_start_method(
-            allow_none=True) is None:
-        try:
-            # 'spawn' is more stable in Colab/Jupyter environment
-            multiprocessing.set_start_method('spawn', force=True)
-            print("[INFO] Multiprocessing start method set to 'spawn' for stability.")
-        except RuntimeError:
-            pass
-
     print("=== IEEE TWC Simulation: Fig 6 (RMSE vs SNR with Jitter Tiers) ===")
     print("Initializing High-Fidelity Physics Simulation...")
     ensure_dir('results')
@@ -165,7 +155,7 @@ def main():
     # --- 3. 仿真扫描配置 ---
     ibo_scan = np.linspace(20, -5, 15)
     jitter_levels = [1e-6, 3e-6, 10e-6]
-    trials_per_point = 500
+    trials_per_point = 200
 
     results = {}
 
@@ -212,8 +202,7 @@ def main():
             # --- B. 并行蒙特卡洛仿真 ---
             seeds = np.random.randint(0, 1e9, trials_per_point)
 
-            # 增加 verbose=10 输出，帮助诊断 joblib 状态
-            errs = Parallel(n_jobs=n_jobs, verbose=10)(
+            errs = Parallel(n_jobs=n_jobs)(
                 delayed(run_trial)(
                     ibo, j_rms, s, noise_std, sig_broadband_truth, N, fs, true_v, config_hw_base, config_det
                 ) for s in seeds
@@ -229,7 +218,7 @@ def main():
             rmse_sim_list.append(rmse)
 
         # 绘制该 Jitter 等级的曲线
-        label = f"{j_rms * 1e6:.0f} $\mu$rad"
+        label = r"$" + f"{j_rms*1e6:.0f}" + r"\ \mu\text{rad}$" # 修复: 使用 Raw String 和 LaTeX 语法
         plt.semilogy(ibo_scan, rmse_sim_list, f'{colors[idx]}o-', label=f'Sim: Jitter={label}', markersize=5)
         plt.semilogy(ibo_scan, bcrlb_theo_list, f'{colors[idx]}--', linewidth=1.5, alpha=0.6)
 
@@ -240,7 +229,7 @@ def main():
 
     # --- 5. 绘图修饰 (双轴图) ---
     ax1 = plt.gca()
-    ax1.set_xlabel('Input Back-Off (dB) [High Power $\leftarrow$]')
+    ax1.set_xlabel(r'Input Back-Off (dB) [High Power $\leftarrow$]')
     ax1.set_ylabel('Ranging RMSE (m/s)', color='k')
     ax1.invert_xaxis()
     ax1.grid(True, which='both', linestyle=':')

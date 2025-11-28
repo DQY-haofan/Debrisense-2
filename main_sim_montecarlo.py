@@ -1,48 +1,28 @@
 # ----------------------------------------------------------------------------------
-# 脚本名称: main_sim_montecarlo.py (核心蒙特卡洛仿真 - 升级版 v4.0 - GPU/CPU自适应)
+# 脚本名称: main_sim_montecarlo.py (核心蒙特卡洛仿真 - 最终修复版 v4.1)
 #
 # 描述:
 #   本脚本是生成 IEEE TWC 论文核心图表 "Fig 6: RMSE vs SNR (The Error Floor)" 的主程序。
-#   实现了对 NumPy/SciPy 运算的 **GPU (CuPy)** 自动检测和加速。
+#   修复了 toeplitz 函数的引用错误，确保在 Colab 环境中稳定运行。
 #
 # 核心功能与升级点:
-#   1. [GPU/CPU自适应]: 自动检测 CUDA GPU。如果可用，则将所有核心计算切换为 CuPy，
-#      实现蒙特卡洛加速。否则回退到 NumPy/joblib CPU 并行。
+#   1. [错误修复]: 显式导入 scipy.linalg 解决 np.linalg.toeplitz 导致的 Traceback。
 #   2. [物理真值]: 使用 10GHz 宽带 DFS 信号作为 Ground Truth。
 #   3. [多级扫描]: 扫描不同 Jitter 强度，绘制 Error Floor 趋势。
+#   4. [CPU并行]: 使用 joblib 进行稳定高效的 CPU 多核并行加速。
 # ----------------------------------------------------------------------------------
 
 import numpy as np
 import matplotlib.pyplot as plt
+import scipy.linalg as sla  # <--- 修复: 显式导入 scipy.linalg
+from tqdm import tqdm
 import os
 import csv
 import multiprocessing
 from joblib import Parallel, delayed
-from tqdm import tqdm
 import time
 
-# --- GPU/CPU 后端动态加载 ---
-try:
-    import cupy as cp
-    import cupy.linalg as cpla
-
-    # 检查是否有可用的 CUDA 设备
-    if cp.cuda.is_available():
-        # 设置 GPU 为计算后端
-        backend = cp
-        backend_la = cpla
-        print("\n[INFO] CUDA GPU Detected. Using CuPy for calculation acceleration.")
-    else:
-        # 回退到 CPU
-        backend = np
-        backend_la = np.linalg
-        print("\n[INFO] CUDA GPU Not Found. Using NumPy (CPU) backend.")
-except ImportError:
-    backend = np
-    backend_la = np.linalg
-    print("\n[INFO] CuPy not installed. Using NumPy (CPU) backend.")
-
-# 导入自定义模块 (需要确保模块内的代码对 backend 库有兼容性)
+# 导入自定义模块
 try:
     from physics_engine import DiffractionChannel
     from hardware_model import HardwareImpairments
@@ -71,7 +51,6 @@ def ensure_dir(directory):
 
 def calc_capacity(snr_linear):
     """ 计算香农容量 C = log2(1 + SNR) """
-    # 始终使用 NumPy 进行标量计算，避免 CuPy 影响
     return np.log2(1 + snr_linear)
 
 
@@ -80,14 +59,7 @@ def calc_bcrlb(snr_linear, jitter_cov_inv, h_sensitivity, scr=1.0):
     计算包含 SCR (自愈效应) 修正的贝叶斯克拉美-罗下界 (BCRLB)
     BCRLB = sqrt( 1 / (J_jitter + J_thermal) )
     """
-    # BCRLB 理论计算部分较快，保持在 CPU (NumPy) 进行
-    # J_jitter, J_thermal 已经是标量
-
-    # 注意：输入 jitter_cov_inv, h_sensitivity 必须是 NumPy 数组
-    if backend != np:
-        jitter_cov_inv = backend.asnumpy(jitter_cov_inv)
-        h_sensitivity = backend.asnumpy(h_sensitivity)
-
+    # jitter_cov_inv 和 h_sensitivity 已经是 NumPy 数组
     h_eff = h_sensitivity * scr
 
     # 1. 抖动信息量 (NumPy 线性代数)
@@ -99,63 +71,37 @@ def calc_bcrlb(snr_linear, jitter_cov_inv, h_sensitivity, scr=1.0):
     return np.sqrt(1.0 / (j_jitter + j_thermal))
 
 
-# --- 单次蒙特卡洛试验函数 (GPU/CPU Aware) ---
+# --- 单次蒙特卡洛试验函数 ---
 def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true_v, hw_base_config, det_config):
     """
     执行单次仿真闭环：
     宽带真值 -> 有色抖动 -> PA非线性 -> 热噪声 -> 对数检测器 -> GLRT估计
     """
-    # 1. 设置随机种子并切换到 GPU/CPU 内存
-    # *CRITICAL*: 这一步将数据从 CPU 内存传到 GPU 内存
+    np.random.seed(seed)
 
-    if backend != np:
-        # 如果是 CuPy，在当前 GPU 上设置随机种子
-        backend.random.seed(seed)
-        # 将输入数据 (truth signal) 移动到 GPU
-        sig_broadband_truth = backend.asarray(sig_broadband_truth)
-    else:
-        backend.random.seed(seed)
-
-    # 2. 实例化对象 (假设它们内部使用 NumP/SciPy，现在通过猴子补丁或 CuPy 兼容代码运行)
     hw_config = hw_base_config.copy()
     hw_config['jitter_rms'] = jitter_rms
 
-    # *注意*: DiffractionChannel, HardwareImpairments, TerahertzDebrisDetector
-    # 必须在内部逻辑中支持 CuPy 运算，如果不支持，则必须手动将 CuPy 结果转回 NumPy
-    # 为简化，这里假设核心算子已兼容或我们只传输 NumPy 数组。
-    # 由于 physics_engine.py 和 detector.py 内部使用了 numpy.linalg 和 numpy.special，
-    # CuPy 无法自动加速，我们保持 NumPy (CPU) 的计算，仅在并行层面优化。
-    # 因此，我们暂时只使用 joblib 的 CPU 并行优化。
-    #
-    # 鉴于 CuPy 兼容性问题在外部模块中存在，我们放弃运行时 CuPy 加速的尝试，
-    # 仅使用 joblib 的 CPU 多进程并行。
-    #
-    # 为保持一致性，我们将 CuPy/GPU 相关的代码块移除，保留 CPU 并行。
-    # 否则需要重写所有三个模块。
-
-    # --- 回退至稳定的 CPU 并行模式 ---
-
-    # 重新初始化本地对象，确保它们在 CPU 内存中运行
     hw_local = HardwareImpairments(hw_config)
     det_local = TerahertzDebrisDetector(fs, N, **det_config)
 
-    # 1. 生成有色 Jitter (CPU)
+    # 1. 生成有色 Jitter
     jitter = hw_local.generate_colored_jitter(N, fs)
     a_jitter = np.exp(jitter)
 
-    # 2. PA 非线性与自愈效应 (CPU)
+    # 2. PA 非线性与自愈效应
     pa_in = sig_broadband_truth * a_jitter
     pa_out, _, _ = hw_local.apply_saleh_pa(pa_in, ibo_dB=ibo)
 
-    # 3. 添加热噪声 (CPU)
+    # 3. 添加热噪声
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     y_rx = pa_out + w
 
-    # 4. 检测器处理 (CPU)
+    # 4. 检测器处理
     z_log = det_local.log_envelope_transform(y_rx)
     z_perp = det_local.apply_projection(z_log)
 
-    # 5. GLRT 速度搜索 (CPU)
+    # 5. GLRT 速度搜索
     v_scan = np.linspace(true_v - 1500, true_v + 1500, 61)
     stats = det_local.glrt_scan(z_perp, v_scan)
 
@@ -163,15 +109,13 @@ def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true
 
     return est_v - true_v
 
-    # --- 结束：回退至稳定的 CPU 并行模式 ---
-
 
 def main():
     print("=== IEEE TWC Simulation: Fig 6 (RMSE vs SNR with Jitter Tiers) ===")
     print("Initializing High-Fidelity Physics Simulation...")
     ensure_dir('results')
 
-    # --- CPU 核心数检测 (保持多进程并行) ---
+    # --- CPU 核心数检测 ---
     num_cores = multiprocessing.cpu_count()
     n_jobs = max(1, num_cores - 2)
     print(f"[INFO] Detected {num_cores} cores. Using {n_jobs} cores for CPU parallel processing.")
@@ -184,6 +128,7 @@ def main():
     t_axis = np.linspace(-T_span / 2, T_span / 2, N)
     true_v = 15000.0
 
+    # 模块配置
     config_phy = {'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': 0.05, 'v_rel': true_v}
     config_hw_base = {'f_knee': 200.0, 'beta_a': 5995.0, 'alpha_a': 10.127}
     config_det = {'cutoff_freq': 300.0, 'L_eff': L_eff, 'a': 0.05}
@@ -198,7 +143,7 @@ def main():
     det_temp = TerahertzDebrisDetector(fs, N, **config_det)
     s_v = det_temp._generate_template(true_v)
     s_v_plus = det_temp._generate_template(true_v + 1.0)
-    h_vec = (s_v_plus - s_v) / 1.0
+    h_vec = (s_v_plus - s_v) / 1.0  # 梯度
 
     # 噪声底校准
     hw_temp = HardwareImpairments(config_hw_base)
@@ -212,7 +157,8 @@ def main():
     jitter_levels = [1e-6, 3e-6, 10e-6]
     trials_per_point = 500
 
-    # 初始化绘图
+    results = {}
+
     plt.figure(figsize=(10, 7))
     colors = ['g', 'b', 'r']
 
@@ -227,7 +173,9 @@ def main():
 
         long_jit = hw_j.generate_colored_jitter(N * 200, fs)
         r_xx = np.correlate(long_jit, long_jit, mode='full')[len(long_jit) - 1: len(long_jit) - 1 + N] / len(long_jit)
-        C_inv = np.linalg.inv(np.linalg.toeplitz(r_xx) + np.eye(N) * 1e-12)  # NumPy 逆矩阵
+
+        # 修正后的协方差逆矩阵计算 (使用 sla.toeplitz 和 np.linalg.inv)
+        C_inv = np.linalg.inv(sla.toeplitz(r_xx) + np.eye(N) * 1e-12)
 
         rmse_sim_list = []
         bcrlb_theo_list = []
@@ -254,7 +202,6 @@ def main():
             # --- B. 并行蒙特卡洛仿真 ---
             seeds = np.random.randint(0, 1e9, trials_per_point)
 
-            # 使用 joblib CPU 并行
             errs = Parallel(n_jobs=n_jobs)(
                 delayed(run_trial)(
                     ibo, j_rms, s, noise_std, sig_broadband_truth, N, fs, true_v, config_hw_base, config_det

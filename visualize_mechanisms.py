@@ -102,6 +102,7 @@ def fig2_hardware_characteristics():
 
     plt.tight_layout()
     save_plot('Fig2_Hardware_Characteristics')
+    plt.close('all') # <--- **FIX: 显式关闭图形对象**
 
     # Export CSV (Splitting into two files for clarity as lengths differ)
     save_csv({'freq': f, 'psd': psd}, 'Fig2a_Jitter_PSD')
@@ -137,11 +138,12 @@ def fig3_dispersion():
     ax2.plot(t_mask * 1000, d_wb_mask, 'b-', linewidth=2, alpha=0.8)
     ax2.set_title('(b) Side-lobe Smearing (Dispersion Evidence)')
     ax2.set_xlabel('Time (ms)')
-    ax2.set_ylabel('|d(t)|')
+    ax2.set_ylabel('|d(t)| (Zoomed)')
     ax2.grid(True)
 
     plt.tight_layout()
     save_plot('Fig3_Dispersion_Analysis')
+    plt.close('all') # <--- **FIX: 显式关闭图形对象**
 
     save_csv({'time_ms': t * 1000, 'amp_nb': d_nb, 'amp_wb': d_wb}, 'Fig3_Dispersion_Analysis')
 
@@ -175,6 +177,7 @@ def fig4_self_healing():
     plt.grid(True)
 
     save_plot('Fig4_Self_Healing_Effect')
+    plt.close('all') # <--- **FIX: 显式关闭图形对象**
     save_csv({'time': t, 'depth_in': ac_in, 'depth_sat': ac_sat}, 'Fig4_Self_Healing_Effect')
 
 
@@ -228,6 +231,7 @@ def fig5_survival_space():
 
     plt.tight_layout()
     save_plot('Fig5_Survival_Space')
+    plt.close('all') # <--- **FIX: 显式关闭图形对象**
 
     save_csv({'freq': f, 'psd_raw': p_raw, 'psd_proj': p_perp}, 'Fig5a_PSD')
     # Spectrogram data is 2D, might be too big for simple CSV, saving flattened axes
@@ -236,8 +240,9 @@ def fig5_survival_space():
 
 if __name__ == "__main__":
     if not os.path.exists('results'): os.makedirs('results')
+    # fig3_dispersion 函数虽然包含在 visualize_mechanisms.py 中，但物理特性可视化
+    # 应该主要由 visualize_physics.py 完成，因此在主运行块中保留 fig2, fig4, fig5。
     fig2_hardware_characteristics()
-    fig3_dispersion()
     fig4_self_healing()
     fig5_survival_space()
     print("\n[Done] All mechanism figures generated.")

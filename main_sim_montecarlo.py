@@ -102,7 +102,7 @@ def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true
     z_perp = det_local.apply_projection(z_log)
 
     # 5. GLRT 速度搜索
-    v_scan = np.linspace(true_v - 1500, true_v + 1500, 61)
+    v_scan = np.linspace(true_v - 1500, true_v + 1500, 41)
     stats = det_local.glrt_scan(z_perp, v_scan)
 
     est_v = v_scan[np.argmax(stats)]
@@ -153,9 +153,9 @@ def main():
     print(f"Calibrated Noise Floor (Std): {noise_std:.2e}")
 
     # --- 3. 仿真扫描配置 ---
-    ibo_scan = np.linspace(20, -5, 15)
+    ibo_scan = np.linspace(15, -5, 15)
     jitter_levels = [1e-6, 3e-6, 10e-6]
-    trials_per_point = 200
+    trials_per_point = 100
 
     results = {}
 

@@ -85,7 +85,7 @@ def run_fig7_roc():
     ensure_dir('results')  # 确保目录存在
     phy = DiffractionChannel(config_phy)
     true_v = 15000.0
-    trials = 2000
+    trials = 1000
     noise_std = 1.5e-3
 
     seeds = np.random.randint(0, 1e9, trials)
@@ -100,7 +100,7 @@ def run_fig7_roc():
 
     # Calculate ROC
     def calc_curve(scores0, scores1):
-        thresholds = np.linspace(min(scores0), max(scores1), 1000)
+        thresholds = np.linspace(min(scores0), max(scores1), 100)
         pfa, pd = [], []
         for th in thresholds:
             pfa.append(np.mean(scores0 > th))
@@ -179,7 +179,7 @@ def run_fig8_velocity():
     v_range = np.logspace(2, 4.5, 20)
     pd_curve = []
 
-    seeds_pd = np.random.randint(0, 1e9, 200)
+    seeds_pd = np.random.randint(0, 1e9, 100)
 
     for v in tqdm(v_range, desc="Scanning Velocity"):
         res = Parallel(n_jobs=n_jobs)(delayed(trial_pd_vel)(v, threshold, s, noise_std) for s in seeds_pd)

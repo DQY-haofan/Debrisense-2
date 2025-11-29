@@ -1,17 +1,3 @@
-# ----------------------------------------------------------------------------------
-# 脚本名称: main_sim_montecarlo.py (核心蒙特卡洛仿真 - 最终修复版 v4.1)
-#
-# 描述:
-#   本脚本是生成 IEEE TWC 论文核心图表 "Fig 6: RMSE vs SNR (The Error Floor)" 的主程序。
-#   修复了 toeplitz 函数的引用错误，确保在 Colab 环境中稳定运行。
-#
-# 核心功能与升级点:
-#   1. [错误修复]: 显式导入 scipy.linalg 解决 np.linalg.toeplitz 导致的 Traceback。
-#   2. [物理真值]: 使用 10GHz 宽带 DFS 信号作为 Ground Truth。
-#   3. [多级扫描]: 扫描不同 Jitter 强度，绘制 Error Floor 趋势。
-#   4. [CPU并行]: 使用 joblib 进行稳定高效的 CPU 多核并行加速。
-# ----------------------------------------------------------------------------------
-
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.linalg as sla  # <--- 修复: 显式导入 scipy.linalg
@@ -21,6 +7,7 @@ import csv
 import multiprocessing
 from joblib import Parallel, delayed
 import time
+import pandas as pd  # 导入 pandas 用于 save_csv
 
 # 导入自定义模块
 try:
@@ -47,6 +34,15 @@ plt.rcParams.update({
 def ensure_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
+
+
+# 新增 CSV 辅助函数，确保路径正确
+def save_csv(data_dict, filename, folder='results/csv_data'):
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    df = pd.DataFrame(data_dict)
+    df.to_csv(f"{folder}/{filename}.csv", index=False)
+    print(f"   [Data] Saved {filename}.csv to {folder}")
 
 
 def calc_capacity(snr_linear):
@@ -102,7 +98,7 @@ def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true
     z_perp = det_local.apply_projection(z_log)
 
     # 5. GLRT 速度搜索
-    v_scan = np.linspace(true_v - 1500, true_v + 1500, 41)
+    v_scan = np.linspace(true_v - 1500, true_v + 1500, 31)
     stats = det_local.glrt_scan(z_perp, v_scan)
 
     est_v = v_scan[np.argmax(stats)]
@@ -111,6 +107,16 @@ def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true
 
 
 def main():
+    # --- 修复: 尝试设置 multiprocessing start method ---
+    if multiprocessing.current_process().name == 'MainProcess' and multiprocessing.get_start_method(
+            allow_none=True) is None:
+        try:
+            # 'spawn' is more stable in Colab/Jupyter environment
+            multiprocessing.set_start_method('spawn', force=True)
+            print("[INFO] Multiprocessing start method set to 'spawn' for stability.")
+        except RuntimeError:
+            pass
+
     print("=== IEEE TWC Simulation: Fig 6 (RMSE vs SNR with Jitter Tiers) ===")
     print("Initializing High-Fidelity Physics Simulation...")
     ensure_dir('results')
@@ -155,7 +161,7 @@ def main():
     # --- 3. 仿真扫描配置 ---
     ibo_scan = np.linspace(15, -5, 15)
     jitter_levels = [1e-6, 3e-6, 10e-6]
-    trials_per_point = 100
+    trials_per_point = 200
 
     results = {}
 
@@ -172,7 +178,8 @@ def main():
         hw_j = HardwareImpairments(hw_config_j)
 
         long_jit = hw_j.generate_colored_jitter(N * 200, fs)
-        r_xx = np.correlate(long_jit, long_jit, mode='full')[len(long_jit) - 1: len(long_jit) - 1 + N] / len(long_jit)
+        r_xx = np.correlate(long_jit, long_jit, mode='full')[
+                   len(long_jit) - 1: len(long_jit) - 1 + N] / len(long_jit)
 
         # 修正后的协方差逆矩阵计算 (使用 sla.toeplitz 和 np.linalg.inv)
         C_inv = np.linalg.inv(sla.toeplitz(r_xx) + np.eye(N) * 1e-12)
@@ -202,7 +209,8 @@ def main():
             # --- B. 并行蒙特卡洛仿真 ---
             seeds = np.random.randint(0, 1e9, trials_per_point)
 
-            errs = Parallel(n_jobs=n_jobs)(
+            # 增加 verbose=10 输出，帮助诊断 joblib 状态
+            errs = Parallel(n_jobs=n_jobs, verbose=10)(
                 delayed(run_trial)(
                     ibo, j_rms, s, noise_std, sig_broadband_truth, N, fs, true_v, config_hw_base, config_det
                 ) for s in seeds
@@ -218,21 +226,28 @@ def main():
             rmse_sim_list.append(rmse)
 
         # 绘制该 Jitter 等级的曲线
-        label = r"$" + f"{j_rms*1e6:.0f}" + r"\ \mu\text{rad}$" # 修复: 使用 Raw String 和 LaTeX 语法
+        label = r"$" + f"{j_rms * 1e6:.0f}" + r"\ \mu\text{rad}$"  # 修复: 使用 Raw String 和 LaTeX 语法
         plt.semilogy(ibo_scan, rmse_sim_list, f'{colors[idx]}o-', label=f'Sim: Jitter={label}', markersize=5)
-        plt.semilogy(ibo_scan, bcrlb_theo_list, f'{colors[idx]}--', linewidth=1.5, alpha=0.6)
+        plt.semilogy(ibo_scan, bcrlb_theo_list, f'{colors[idx]}--', linewidth=1.5, alpha=0.6,
+                     label='BCRLB' if idx == 0 else "")  # 仅为第一条理论线添加标签
 
         # 存储结果 (为 CSV 准备)
         results[f"rmse_sim_{label}"] = rmse_sim_list
         results[f"bcrlb_{label}"] = bcrlb_theo_list
-        results[f"capacity"] = cap_curve
+        # Capacity 只需存储一次
+        if idx == 0:
+            results[f"capacity"] = cap_curve
 
     # --- 5. 绘图修饰 (双轴图) ---
     ax1 = plt.gca()
+    # 修复: 使用 Raw String 和正确的 LaTeX 语法
     ax1.set_xlabel(r'Input Back-Off (dB) [High Power $\leftarrow$]')
     ax1.set_ylabel('Ranging RMSE (m/s)', color='k')
     ax1.invert_xaxis()
     ax1.grid(True, which='both', linestyle=':')
+
+    # [可视化 FIX 1] Y 轴范围调整 (隐藏 1000.0 的失败点，聚焦于有效数据)
+    ax1.set_ylim(50, 1500)
 
     # 右轴：通信容量 (Capacity)
     ax2 = ax1.twinx()
@@ -240,14 +255,14 @@ def main():
     ax2.set_ylabel('Spectral Efficiency (bits/s/Hz)', color='gray')
     ax2.tick_params(axis='y', labelcolor='gray')
 
-    # 图例合并
+    # [可视化 FIX 2] 图例合并与定位调整 (移到右下角或最佳位置)
     lines_rmse = [line for line in ax1.lines]
     lines_cap = [line_cap]
 
     legend_elements = lines_rmse + lines_cap
     legend_labels = [l.get_label() for l in legend_elements]
-    ax1.legend(legend_elements, legend_labels, loc='upper center', bbox_to_anchor=(0.5, 1.15), ncol=3, fancybox=True,
-               shadow=True, title="Legend")
+    # 使用 loc='lower center' 或 'best'
+    ax1.legend(legend_elements, legend_labels, loc='lower center', ncol=2, fancybox=True, shadow=True, title="Legend")
 
     plt.title('Fig 6: ISAC Performance Trade-off & Error Floor Verification')
     plt.tight_layout()
@@ -257,15 +272,18 @@ def main():
     plt.savefig(f'{plot_path}.png', dpi=300)
     plt.savefig(f'{plot_path}.pdf', format='pdf')
 
-    # 保存数值数据 (CSV)
+    # [CSV FIX] 保存数值数据 (CSV) - 确保路径在 csv_data/
     results['ibo'] = ibo_scan
-    csv_path = 'results/Fig6_data.csv'
-    keys = sorted(results.keys())
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(keys)
-        writer.writerows(zip(*[results[k] for k in keys]))
-    print(f"\n[Success] Fig 6 Generated. Data saved to {csv_path}")
+
+    # 构造 CSV 数据字典
+    csv_data_dict = {'ibo': results['ibo'], 'capacity': results['capacity']}
+    for k in results.keys():
+        if k not in ['ibo', 'capacity']:
+            csv_data_dict[k] = results[k]
+
+    save_csv(csv_data_dict, 'Fig6_data')
+
+    print(f"\n[Success] Fig 6 Generated. Data saved to results/csv_data/Fig6_data.csv")
 
 
 if __name__ == "__main__":

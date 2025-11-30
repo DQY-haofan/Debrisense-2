@@ -1,14 +1,7 @@
 # ----------------------------------------------------------------------------------
-# 脚本名称: sim_advanced_metrics_opt.py (极速优化版)
-# 版本: v5.0 (Optimized Speed & Correct Physics)
-# 描述:
-#   用于生成论文中的 Fig 8 (最小可探测尺寸 MDS) 和 Fig 9 (通感一体化权衡 ISAC Trade-off)。
-#
-#   关键优化:
-#   1. 引入 Template Bank (模板库): 预计算所有速度假设对应的模板，避免在蒙特卡洛循环中重复计算物理场。
-#      速度提升: >100倍 (从数小时缩短至几分钟)。
-#   2. 物理一致性: 强制使用 N_sub=32 的 DFS 算法，确保宽带色散效应被正确捕获 (Correlation=1.0)。
-#   3. 数据管理: 所有结果自动保存至 results/csv_data/。
+# 脚本名称: sim_advanced_metrics.py (优化版)
+# 描述: 生成 Fig 8 (MDS) 和 Fig 9 (ISAC Trade-off)
+# 优化: 物理信号预计算 + 模板库并行生成
 # ----------------------------------------------------------------------------------
 
 import numpy as np
@@ -19,7 +12,7 @@ import os
 import pandas as pd
 from tqdm import tqdm
 
-# 导入自定义核心模块
+# 导入模块
 try:
     from physics_engine import DiffractionChannel
     from hardware_model import HardwareImpairments
@@ -27,295 +20,276 @@ try:
 except ImportError:
     raise SystemExit("Missing modules. Ensure physics_engine.py, hardware_model.py, detector.py are present.")
 
-# 绘图字体配置 (符合 IEEE 投稿标准)
+# 绘图配置
 plt.rcParams.update({'font.family': 'serif', 'font.size': 12, 'pdf.fonttype': 42})
 
-
-def ensure_dir(d):
-    """确保目录存在"""
-    if not os.path.exists(d): os.makedirs(d)
-
-
-def save_csv(data_dict, filename, folder='results/csv_data'):
-    """统一 CSV 保存接口"""
-    if not os.path.exists(folder): os.makedirs(folder)
-    # 处理长度不一致的数据列 (填充 NaN)
-    max_len = max([len(v) if hasattr(v, '__len__') else 1 for v in data_dict.values()])
-    aligned_data = {}
-    for k, v in data_dict.items():
-        if hasattr(v, '__len__'):
-            padded = np.full(max_len, np.nan)
-            padded[:len(v)] = v
-            aligned_data[k] = padded
-        else:
-            aligned_data[k] = np.full(max_len, v)
-    df = pd.DataFrame(aligned_data)
-    df.to_csv(f"{folder}/{filename}.csv", index=False)
-    print(f"   [Data] Saved {filename}.csv")
-
-
-# --- 核心仿真配置 (Core Configuration) ---
-L_eff = 50e3  # 有效基线长度 50km
-fs = 200e3  # 采样率 200kHz (防止 Chirp 混叠)
-T_span = 0.02  # 观测窗口 20ms (涵盖主能量区)
+# --- 全局配置 ---
+L_eff = 50e3
+fs = 200e3
+T_span = 0.02
 N = int(fs * T_span)
-
-# [CRITICAL] 统一时间轴生成，确保与 Detector 内部逻辑完全一致
 t_axis = np.arange(N) / fs - (N / 2) / fs
+true_v = 15000.0
 
-true_v = 15000.0  # 真实相对速度 15km/s
-
-# 硬件配置 (SOTA 参数 + PLL 跟踪)
+# 硬件参数 (SOTA)
 config_hw = {
-    'jitter_rms': 0.5e-6,  # 0.5 urad (高稳平台)
+    'jitter_rms': 0.5e-6,
     'f_knee': 200.0,
     'beta_a': 5995.0,
     'alpha_a': 10.127,
-    'L_1MHz': -95.0,  # 低相位噪声振荡器
+    'L_1MHz': -95.0,
     'L_floor': -120.0,
-    'pll_bw': 50e3  # 50kHz PLL 带宽
+    'pll_bw': 50e3
 }
 
-# 检测器配置 (显式传递 N_sub=32 以匹配物理引擎)
+# 检测器参数 (N_sub=32 对齐物理引擎)
 config_det_base = {'cutoff_freq': 300.0, 'L_eff': L_eff, 'N_sub': 32}
 
-# 并行计算核心数
+# 并行核心数
 num_cores = multiprocessing.cpu_count()
 n_jobs = max(1, num_cores - 2)
 
 
+def ensure_dir(d):
+    if not os.path.exists(d): os.makedirs(d)
+
+
+def save_csv(data, filename):
+    folder = 'results/csv_data'
+    ensure_dir(folder)
+    pd.DataFrame(data).to_csv(f"{folder}/{filename}.csv", index=False)
+    print(f"   [Data] Saved {filename}.csv")
+
+
 # =========================================================================
 # Task 1: Fig 8 - 探测能力边界 (MDS)
-# 逻辑: 扫描碎片尺寸，计算检测概率 Pd
+# 优化策略: 物理信号在循环外生成一次，循环内只加噪声
 # =========================================================================
 
-def run_trial_stat(is_h1, a_val, seed, noise_std):
-    """ 单次检测试验 (返回 GLRT 统计量) """
+def run_noise_injection_trial(is_h1, sig_clean, seed, noise_std):
+    """
+    仅负责注入噪声和检测，不进行物理计算
+    """
     np.random.seed(seed)
     hw = HardwareImpairments(config_hw)
-    # 检测器使用匹配的尺寸 a=a_val (假设 Filter Bank 覆盖了该尺寸)
-    det = TerahertzDebrisDetector(fs, N, a=a_val, **config_det_base)
+    # 检测器实例化开销极小
+    det = TerahertzDebrisDetector(fs, N, a=0.05, **config_det_base)  # a这里不影响log变换和投影
 
-    # 1. 生成物理信号
+    # 1. 选择信号
     if is_h1:
-        phy = DiffractionChannel({'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': a_val, 'v_rel': true_v})
-        d_wb = phy.generate_broadband_chirp(t_axis, N_sub=32)
-        sig = 1.0 - d_wb  # 阴影模型: 1 - d
+        sig_base = sig_clean
     else:
-        sig = np.ones(N, dtype=np.complex128)  # 仅有载波
+        sig_base = np.ones(N, dtype=np.complex128)
 
-    # 2. 注入硬件损伤
+    # 2. 注入硬件损伤 (快速 FFT)
     jit = np.exp(hw.generate_colored_jitter(N, fs))
     pn = np.exp(1j * hw.generate_phase_noise(N, fs))
 
-    pa_in = sig * jit * pn
-    pa_out, _, _ = hw.apply_saleh_pa(pa_in, ibo_dB=10.0)  # 线性区工作
-
-    # 3. 添加热噪声
+    # 3. PA & 热噪声
+    pa_in = sig_base * jit * pn
+    pa_out, _, _ = hw.apply_saleh_pa(pa_in, ibo_dB=10.0)
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     y_rx = pa_out + w
 
-    # 4. 检测器处理
-    z_log = det.log_envelope_transform(pa_out + w)
+    # 4. 检测统计量
+    z_log = det.log_envelope_transform(y_rx)
     z_perp = det.apply_projection(z_log)
-    s_temp = det.P_perp @ det._generate_template(true_v)
 
-    # 5. 计算统计量
-    energy = np.sum(s_temp ** 2)
-    if energy < 1e-20: return 0.0
-
-    stat = (np.dot(s_temp, z_perp) ** 2) / energy
-    return stat
+    # 获取对应尺寸的模板 (注意: 这里需要稍微小心，如果 sig_clean 对应的 a 变了，
+    # 理论上检测器应该用对应的模板。为了简化，我们假设检测器完全匹配目标尺寸)
+    # 在主循环中我们会传入匹配的模板向量 s_template_perp
+    return z_perp
 
 
 def run_fig8_mds():
-    print("\n=== Running Task 1: Fig 8 (MDS Scan) ===")
+    print("\n=== Running Task 1: Fig 8 (MDS Scan) [Optimized] ===")
 
-    noise_std = 1.0e-5  # 低噪声底 (-100dBc)
-
-    # 扫描碎片直径: 2mm 到 50mm (对数分布)
-    diameters_mm = np.logspace(0.3, 1.7, 15)
+    noise_std = 1.0e-5
+    diameters_mm = np.logspace(0.3, 1.7, 10)  # 减少点数以加速预览 (10个点足够画曲线)
     radii_m = diameters_mm / 2000.0
     pd_curve = []
 
-    for a_val in tqdm(radii_m, desc="Sweeping Size"):
-        # A. 计算动态门限 (基于当前尺寸模板的 H0 分布)
-        # Pfa = 1% (为了曲线平滑，实际 TWC 可设 1e-4)
-        seeds_h0 = np.random.randint(0, 1e9, 200)
-        stats_h0 = Parallel(n_jobs=n_jobs)(
-            delayed(run_trial_stat)(False, a_val, s, noise_std) for s in seeds_h0
+    # 预实例化检测器以获取投影矩阵 (P_perp 与 a 无关)
+    det_base = TerahertzDebrisDetector(fs, N, **config_det_base)
+    P_perp = det_base.P_perp
+
+    for a_val in tqdm(radii_m, desc="Size Scan"):
+        # [优化点 1]：在循环外生成纯净物理信号 (耗时操作)
+        phy = DiffractionChannel({'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': a_val, 'v_rel': true_v})
+        d_wb = phy.generate_broadband_chirp(t_axis, N_sub=32)
+        sig_clean = 1.0 - d_wb
+
+        # [优化点 2]: 生成匹配模板 (用于 GLRT)
+        # 检测器需要重新实例化以更新内部参数 a (虽然 _generate_template 会用到)
+        det_temp = TerahertzDebrisDetector(fs, N, a=a_val, **config_det_base)
+        s_raw = det_temp._generate_template(true_v)
+        s_template = P_perp @ s_raw
+        energy = np.sum(s_template ** 2) + 1e-20
+
+        # A. H0 统计量 (无目标) - 并行计算
+        # 注意: H0 不需要 sig_clean，传 None 或 ones
+        seeds_h0 = np.random.randint(0, 1e9, 100)  # 减少次数: 200 -> 100
+        results_h0 = Parallel(n_jobs=n_jobs)(
+            delayed(run_noise_injection_trial)(False, None, s, noise_std)
+            for s in seeds_h0
         )
+        # 计算统计量
+        stats_h0 = [(np.dot(s_template, z_p) ** 2) / energy for z_p in results_h0]
         threshold = np.percentile(stats_h0, 99.0)
 
-        # B. 计算 H1 检测率
-        seeds_h1 = np.random.randint(0, 1e9, 100)
-        stats_h1 = Parallel(n_jobs=n_jobs)(
-            delayed(run_trial_stat)(True, a_val, s, noise_std) for s in seeds_h1
+        # B. H1 统计量 (有目标)
+        seeds_h1 = np.random.randint(0, 1e9, 50)  # 减少次数: 100 -> 50
+        results_h1 = Parallel(n_jobs=n_jobs)(
+            delayed(run_noise_injection_trial)(True, sig_clean, s, noise_std)
+            for s in seeds_h1
         )
+        stats_h1 = [(np.dot(s_template, z_p) ** 2) / energy for z_p in results_h1]
+
         pd_val = np.mean(np.array(stats_h1) > threshold)
         pd_curve.append(pd_val)
 
     # 绘图
     plt.figure(figsize=(8, 6))
     plt.semilogx(diameters_mm, pd_curve, 'b-o', linewidth=2, label='300 GHz FSR')
-    plt.axhline(0.5, color='k', linestyle=':', alpha=0.5, label='Detection Limit')
-
+    plt.axhline(0.5, color='k', linestyle=':', alpha=0.5)
     plt.xlabel('Debris Diameter (mm)')
     plt.ylabel('Probability of Detection ($P_d$)')
-    plt.title(f'Fig 8: Detection Capability (MDS Analysis)')
-    plt.grid(True, which='both', linestyle=':')
-    plt.legend()
-    plt.tight_layout()
-
-    plt.savefig('results/Fig8_Detection_Capability.png', dpi=300)
-    plt.savefig('results/Fig8_Detection_Capability.pdf', format='pdf')
-    save_csv({'diameter_mm': diameters_mm, 'pd': pd_curve}, 'Fig8_MDS_Data')
+    plt.title('Fig 8: Detection Capability (MDS)')
+    plt.grid(True, which='both')
+    plt.savefig('results/Fig8_MDS.png')
+    save_csv({'d_mm': diameters_mm, 'pd': pd_curve}, 'Fig8_MDS')
 
 
 # =========================================================================
-# Task 2: Fig 9 - ISAC Trade-off (极速优化版)
-# 逻辑: 扫描 PA 回退 (IBO)，权衡通信容量与感知 RMSE
-# 优化: 预计算模板库 (Template Bank)
+# Task 2: Fig 9 - ISAC Trade-off
+# 优化策略: 并行生成模板库 + 矩阵化 GLRT
 # =========================================================================
 
-def precompute_template_bank(v_scan):
-    """
-    [OPTIMIZATION CORE] 预计算所有速度假设对应的模板
-    """
-    print(f"   [Optim] Pre-computing Template Bank ({len(v_scan)} velocity hypotheses)...")
+def generate_single_template(v, det_config):
+    """ 辅助函数: 单个模板生成 (用于并行化) """
+    det = TerahertzDebrisDetector(fs, N, a=0.05, **det_config)
+    s_raw = det._generate_template(v)
+    return s_raw
 
-    # 实例化一次检测器
-    # 注意: Trade-off 分析通常针对标准目标 (a=5cm)
+
+def precompute_template_bank_parallel(v_scan):
+    print(f"   [Optim] Parallel generating {len(v_scan)} templates...")
+
+    # [优化点 3]: 并行生成原始模板
+    # 注意: 这里只生成 s_raw，投影在主线程做 (矩阵乘法很快)
+    s_raw_list = Parallel(n_jobs=n_jobs)(
+        delayed(generate_single_template)(v, config_det_base)
+        for v in v_scan
+    )
+
+    # 转换为矩阵
+    S_raw = np.array(s_raw_list)  # (N_vel, N)
+
+    # 获取投影矩阵
     det = TerahertzDebrisDetector(fs, N, a=0.05, **config_det_base)
+    P_perp = det.P_perp
 
-    # 模板矩阵: (N_vel, N_samples)
-    # 能量向量: (N_vel,)
-    template_bank = np.zeros((len(v_scan), N))
+    # 批量投影: S_perp = S_raw @ P_perp.T (因为 P是对称的)
+    # 但由于 N~4000, 矩阵乘法 (N_vel, N) @ (N, N) 较慢
+    # 更快的方法是: S_perp = S_raw - (S_raw @ H) @ H.T
+    # 这里直接用检测器自带的逻辑循环投影也行，或者利用 apply_projection 的矩阵化
+
+    print("   [Optim] Projecting templates...")
+    S_perp = np.zeros_like(S_raw)
     energies = np.zeros(len(v_scan))
 
-    for i, v in enumerate(v_scan):
-        s_raw = det._generate_template(v)
-        s_perp = det.P_perp @ s_raw
-        template_bank[i, :] = s_perp
-        energies[i] = np.sum(s_perp ** 2) + 1e-20
+    for i in range(len(v_scan)):
+        s_p = P_perp @ S_raw[i]
+        S_perp[i] = s_p
+        energies[i] = np.sum(s_p ** 2) + 1e-20
 
-    return template_bank, energies, det.P_perp
+    return S_perp, energies, P_perp
 
 
-def run_isac_trial_opt(ibo, seed, noise_std, sig_truth, template_bank, template_energies, v_scan, P_perp):
-    """
-    单次试验 (极速版): 仅包含矩阵乘法
-    """
+def run_isac_trial_fast(ibo, seed, noise_std, sig_truth, template_bank, template_energies, v_scan, P_perp):
     np.random.seed(seed)
     hw = HardwareImpairments(config_hw)
+    det = TerahertzDebrisDetector(fs, N, a=0.05, **config_det_base)  # 仅用于log变换
 
-    # 辅助检测器 (仅用于 Log 变换)
-    det = TerahertzDebrisDetector(fs, N, a=0.05, **config_det_base)
-
-    # 1. 注入损伤
+    # 1. 损伤
     jit = np.exp(hw.generate_colored_jitter(N, fs))
     pn = np.exp(1j * hw.generate_phase_noise(N, fs))
 
-    # 2. PA 放大 (关键变量: IBO)
+    # 2. PA
     pa_in = sig_truth * jit * pn
     pa_out, _, _ = hw.apply_saleh_pa(pa_in, ibo_dB=ibo)
 
-    # 指标 A: 通信容量
+    # Comm Capacity (Upper Bound)
     p_rx = np.mean(np.abs(pa_out) ** 2)
-    snr_lin = p_rx / (noise_std ** 2)
-    capacity = np.log2(1 + snr_lin)
+    gamma_eff = 0.01  # SOTA hardware factor
+    sinr_lin = p_rx / (noise_std ** 2 + p_rx * gamma_eff)
+    capacity = np.log2(1 + sinr_lin)
 
-    # 指标 B: 感知 RMSE
+    # Sensing RMSE
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-    y_rx = pa_out + w
+    z_log = det.log_envelope_transform(pa_out + w)
+    z_perp = P_perp @ z_log
 
-    z_log = det.log_envelope_transform(y_rx)
-    z_perp = P_perp @ z_log  # 使用预计算投影矩阵
-
-    # --- Matrix GLRT (Vectorized Speed Up) ---
-    # 一次性计算所有假设的相关性: (N_vel, N) @ (N,) -> (N_vel,)
+    # Matrix GLRT
     correlations = np.dot(template_bank, z_perp)
     stats = (correlations ** 2) / template_energies
-
-    # 峰值搜索
     est_v = v_scan[np.argmax(stats)]
-    err_v = abs(est_v - true_v)
 
-    return capacity, err_v
+    return capacity, abs(est_v - true_v)
 
 
 def run_fig9_isac_optimized():
-    print("\n=== Running Task 2: Fig 9 (ISAC Trade-off) [OPTIMIZED] ===")
+    print("\n=== Running Task 2: Fig 9 (ISAC Trade-off) [Optimized] ===")
 
-    # 1. 准备物理真值 (Ground Truth)
+    # 1. 物理真值 (只算一次)
     phy = DiffractionChannel({'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': 0.05, 'v_rel': true_v})
     d_wb = phy.generate_broadband_chirp(t_axis, N_sub=32)
     sig_truth = 1.0 - d_wb
 
-    # 2. 生成模板库 (Filter Bank)
-    # 扫描范围: +/- 2000 m/s，步长 10 m/s -> 401 个假设
-    v_scan = np.linspace(true_v - 2000, true_v + 2000, 401)
-    template_bank, energies, P_perp = precompute_template_bank(v_scan)
+    # 2. 模板库
+    v_scan = np.linspace(true_v - 2000, true_v + 2000, 201)  # 减少密度: 401 -> 201
+    template_bank, energies, P_perp = precompute_template_bank_parallel(v_scan)
 
-    # 3. 仿真扫描
+    # 3. 扫描 IBO
     noise_std = 2.0e-5
-    ibo_points = np.linspace(20, -5, 15)  # 从线性区到深度饱和
-    trials = 50  # 蒙特卡洛次数
+    ibo_points = np.linspace(20, -5, 10)  # 减少点数: 15 -> 10
+    trials = 30  # 减少次数: 50 -> 30
 
     avg_cap = []
     avg_rmse = []
 
-    for ibo in tqdm(ibo_points, desc="IBO Scan (Fast)"):
+    for ibo in tqdm(ibo_points, desc="IBO Scan"):
         res = Parallel(n_jobs=n_jobs)(
-            delayed(run_isac_trial_opt)(
+            delayed(run_isac_trial_fast)(
                 ibo, s, noise_std, sig_truth, template_bank, energies, v_scan, P_perp
             ) for s in range(trials)
         )
         res = np.array(res)
-
-        # 统计结果
         avg_cap.append(np.mean(res[:, 0]))
 
-        # 鲁棒 RMSE (剔除失锁点)
         errs = res[:, 1]
-        valid = errs[errs < 1800]
+        valid = errs[errs < 1800]  # 去除野值
         rmse = np.sqrt(np.mean(valid ** 2)) if len(valid) > 5 else 2000.0
         avg_rmse.append(rmse)
 
     # 绘图
     plt.figure(figsize=(9, 7))
-    sc = plt.scatter(avg_cap, avg_rmse, c=ibo_points, cmap='viridis_r', s=100, edgecolors='k', zorder=5)
-    plt.plot(avg_cap, avg_rmse, 'k--', alpha=0.5, zorder=1)
-
-    cbar = plt.colorbar(sc)
-    cbar.set_label('Input Back-Off (dB) [High Power $\leftarrow$]')
-
-    plt.xlabel('Comm Capacity (bits/s/Hz)')
-    plt.ylabel('Sensing RMSE (m/s)')
-    plt.title('Fig 9: ISAC Trade-off (Pareto Frontier)')
-    plt.grid(True, linestyle=':')
-
-    # 区域标注
-    plt.annotate('Linear Region\n(Best Accuracy)',
-                 xy=(avg_cap[0], avg_rmse[0]), xytext=(avg_cap[0], avg_rmse[0] * 1.2),
-                 arrowprops=dict(facecolor='black', shrink=0.05), ha='center')
-
-    plt.annotate('Saturation Region\n(Self-Healing Error)',
-                 xy=(avg_cap[-1], avg_rmse[-1]), xytext=(avg_cap[-1], avg_rmse[-1] * 0.8),
-                 arrowprops=dict(facecolor='red', shrink=0.05), ha='center')
-
-    plt.tight_layout()
-    plt.savefig('results/Fig9_ISAC_Tradeoff.png', dpi=300)
-    plt.savefig('results/Fig9_ISAC_Tradeoff.pdf', format='pdf')
-    save_csv({'ibo': ibo_points, 'capacity': avg_cap, 'rmse': avg_rmse}, 'Fig9_ISAC_Data')
+    sc = plt.scatter(avg_cap, avg_rmse, c=ibo_points, cmap='viridis_r', s=100, edgecolors='k')
+    plt.plot(avg_cap, avg_rmse, 'k--', alpha=0.5)
+    plt.colorbar(sc, label='IBO (dB)')
+    plt.xlabel('Capacity (bits/s/Hz)')
+    plt.ylabel('RMSE (m/s)')
+    plt.title('Fig 9: ISAC Trade-off')
+    plt.grid(True)
+    plt.savefig('results/Fig9_ISAC.png')
+    save_csv({'ibo': ibo_points, 'cap': avg_cap, 'rmse': avg_rmse}, 'Fig9_ISAC')
 
 
 if __name__ == "__main__":
-    ensure_dir('results/csv_data')
     multiprocessing.freeze_support()
+    ensure_dir('results')
 
-    # 依次执行
     run_fig8_mds()
     run_fig9_isac_optimized()
 
-    print("\n[Done] All advanced metrics generated successfully.")
+    print("\n[Done] All simulations completed successfully.")

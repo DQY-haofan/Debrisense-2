@@ -31,9 +31,9 @@ def save_csv(data_dict, filename, folder='results/csv_data'):
 
 # --- 公共配置 (CRITICAL FIX: 采样率与窗口优化) ---
 L_eff = 50e3
-# [FIX] fs 提高到 200kHz 以避免 Chirp 信号混叠
+# [FIX] fs 提高到 200kHz 以避免 Chirp 信号混叠 (覆盖 ~100kHz 带宽)
 fs = 200e3
-# [FIX] 窗口缩短到 20ms (FSR 信号能量集中在中心 ~5ms，长尾不仅无用还会引入更多噪声)
+# [FIX] 窗口缩短到 20ms (FSR 信号能量集中在中心 ~5ms，避免长尾混叠)
 T_span = 0.02
 N = int(fs * T_span)
 t_axis = np.linspace(-T_span / 2, T_span / 2, N)
@@ -98,7 +98,7 @@ def get_h1_stat(a_val, seed, noise_std):
     phy_conf = {'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': a_val, 'v_rel': true_v}
     phy = DiffractionChannel(phy_conf)
 
-    # 宽带生成 (注意：fs 提高后，物理引擎会生成更精细的波形)
+    # 宽带生成 (注意：fs 提高后，物理引擎会生成更精细的波形，避免混叠)
     d_wb = phy.generate_broadband_chirp(t_axis, N_sub=32)
     sig = 1.0 + d_wb
 

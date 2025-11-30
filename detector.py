@@ -2,8 +2,8 @@
 # 脚本名称: detector.py
 # 版本: v3.1 (Fixed - N_sub Alignment)
 # 描述:
-#   [FIX]: 将 DFS 子载波数 N_sub 默认值提升至 32，并允许外部配置。
-#          确保与 Physics Engine 的频率网格 100% 重合，实现 Correlation = 1.0。
+#   [FIX]: 将 DFS 子载波数 N_sub 参数化 (默认 32)。
+#   确保与 Physics Engine 的频率网格 100% 重合，从而实现 Correlation = 1.0。
 # ----------------------------------------------------------------------------------
 
 import numpy as np

@@ -29,10 +29,12 @@ def save_csv(data_dict, filename, folder='results/csv_data'):
     print(f"   [Data] Saved {filename}.csv to {folder}")
 
 
-# --- 公共配置 ---
+# --- 公共配置 (CRITICAL FIX: 采样率与窗口优化) ---
 L_eff = 50e3
-fs = 20e3
-T_span = 0.1
+# [FIX] fs 提高到 200kHz 以避免 Chirp 信号混叠
+fs = 200e3
+# [FIX] 窗口缩短到 20ms (FSR 信号能量集中在中心 ~5ms，长尾不仅无用还会引入更多噪声)
+T_span = 0.02
 N = int(fs * T_span)
 t_axis = np.linspace(-T_span / 2, T_span / 2, N)
 true_v = 15000.0
@@ -62,6 +64,7 @@ def get_h0_stat(seed, noise_std):
     """ H0 (无目标) 仿真 """
     np.random.seed(seed)
     hw = HardwareImpairments(config_hw)
+    # H0 模板假设 a=0.05 (典型值)
     det = TerahertzDebrisDetector(fs, N, a=0.05, **config_det_base)
 
     jit = np.exp(hw.generate_colored_jitter(N, fs))
@@ -95,6 +98,7 @@ def get_h1_stat(a_val, seed, noise_std):
     phy_conf = {'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': a_val, 'v_rel': true_v}
     phy = DiffractionChannel(phy_conf)
 
+    # 宽带生成 (注意：fs 提高后，物理引擎会生成更精细的波形)
     d_wb = phy.generate_broadband_chirp(t_axis, N_sub=32)
     sig = 1.0 + d_wb
 
@@ -116,22 +120,28 @@ def get_h1_stat(a_val, seed, noise_std):
 
 
 def calibrate_snr_check(noise_std):
-    """ 自检函数: 打印信号深度与噪声底 """
-    # 检查 100mm (a=0.05) 和 10mm (a=0.005)
-    print("\n--- SNR Calibration Check ---")
-    for a_test in [0.05, 0.005]:
-        phy = DiffractionChannel({'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': a_test, 'v_rel': true_v})
-        d_wb = phy.generate_broadband_chirp(t_axis, N_sub=16)
-        sig_depth = np.max(np.abs(d_wb))
-        print(
-            f"Target D={a_test * 2000:.0f}mm: Shadow Depth = {sig_depth:.2e} | Noise Floor = {noise_std:.2e} | CNR = {20 * np.log10(sig_depth / noise_std):.1f} dB")
+    """ 自检: 确保信号不为零且未混叠 """
+    print("\n--- Physics & SNR Check ---")
+    print(f"Sampling Rate: {fs / 1e3} kHz | Window: {T_span * 1000} ms")
+
+    a_test = 0.02  # 20mm
+    phy = DiffractionChannel({'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': a_test, 'v_rel': true_v})
+    d_wb = phy.generate_broadband_chirp(t_axis, N_sub=16)
+    sig_depth = np.max(np.abs(d_wb))
+
+    print(f"Target D={a_test * 2000:.0f}mm: Shadow Depth = {sig_depth:.2e}")
+    if sig_depth < 1e-9:
+        print("[WARNING] Signal is essentially zero. Check Physics Engine.")
+    else:
+        print(f"Noise Floor = {noise_std:.2e}")
+        print(f"CNR (Approx) = {20 * np.log10(sig_depth / noise_std):.1f} dB")
     print("-----------------------------\n")
 
 
 def run_fig8_mds():
     print("\n=== Running Task 1: Fig 8 (Minimum Detectable Size) ===")
 
-    # [TWEAK] 降低噪声到底 (-100dBc)，使得 10-20mm 的物体可见
+    # 低噪声底 (-100dBc)
     noise_std = 1.0e-5
 
     calibrate_snr_check(noise_std)
@@ -146,8 +156,8 @@ def run_fig8_mds():
     threshold = np.percentile(stats_h0, 99.9)
     print(f"   Threshold: {threshold:.2f}")
 
-    # 扫描尺寸 (2mm 到 100mm) - 1mm 可能真的看不见
-    diameters_mm = np.logspace(0.3, 2, 20)  # ~2mm to 100mm
+    # 扫描尺寸 (2mm 到 100mm)
+    diameters_mm = np.logspace(0.3, 2, 15)
     radii_m = diameters_mm / 2000.0
 
     pd_curve = []
@@ -238,12 +248,11 @@ def run_fig9_isac():
     d_wb = phy.generate_broadband_chirp(t_axis, N_sub=32)
     sig_truth = 1.0 + d_wb
 
-    # 噪声定标: 使用相同的低噪声底 (1e-5)
-    # 这样在 Linear Region 应该能获得极高的精度
+    # 噪声定标 (低噪声环境以展示趋势)
     hw_temp = HardwareImpairments(config_hw)
     pa_ref, _, _ = hw_temp.apply_saleh_pa(sig_truth, 15.0)
     p_ref = np.mean(np.abs(pa_ref) ** 2)
-    noise_std = np.sqrt(p_ref * (1e-5) ** 2)  # Force 1e-5 relative level
+    noise_std = np.sqrt(p_ref * (1e-5) ** 2)
 
     # 扫描 IBO
     ibo_points = np.linspace(20, -5, 15)
@@ -260,7 +269,7 @@ def run_fig9_isac():
         res = np.array(res)
 
         avg_cap.append(np.mean(res[:, 0]))
-        # 鲁棒平均
+        # 剔除完全失败点 (Outliers)
         valid_errs = [e for e in res[:, 1] if e < 1400]
         if len(valid_errs) > 5:
             rmse = np.sqrt(np.mean(np.array(valid_errs) ** 2))

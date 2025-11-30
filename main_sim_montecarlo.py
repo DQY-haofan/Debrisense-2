@@ -1,13 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import scipy.linalg as sla  # <--- 修复: 显式导入 scipy.linalg
+import scipy.linalg as sla
 from tqdm import tqdm
 import os
-import csv
 import multiprocessing
 from joblib import Parallel, delayed
-import time
-import pandas as pd  # 导入 pandas 用于 save_csv
+import pandas as pd
 
 # 导入自定义模块
 try:
@@ -15,8 +13,7 @@ try:
     from hardware_model import HardwareImpairments
     from detector import TerahertzDebrisDetector
 except ImportError:
-    print(
-        "Error: Dependent modules not found. Please ensure physics_engine.py, hardware_model.py, detector.py are in the same folder.")
+    print("Error: Dependent modules not found.")
     raise SystemExit
 
 # 设置 Matplotlib 绘图标准
@@ -36,42 +33,28 @@ def ensure_dir(directory):
         os.makedirs(directory)
 
 
-# 新增 CSV 辅助函数，确保路径正确
 def save_csv(data_dict, filename, folder='results/csv_data'):
     if not os.path.exists(folder):
         os.makedirs(folder)
-    df = pd.DataFrame(data_dict)
+    # 处理不同长度的数据，转换为 DataFrame
+    df = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in data_dict.items()]))
     df.to_csv(f"{folder}/{filename}.csv", index=False)
     print(f"   [Data] Saved {filename}.csv to {folder}")
 
 
-def calc_capacity(snr_linear):
-    """ 计算香农容量 C = log2(1 + SNR) """
-    return np.log2(1 + snr_linear)
-
-
 def calc_bcrlb(snr_linear, jitter_cov_inv, h_sensitivity, scr=1.0):
-    """
-    计算包含 SCR (自愈效应) 修正的贝叶斯克拉美-罗下界 (BCRLB)
-    BCRLB = sqrt( 1 / (J_jitter + J_thermal) )
-    """
-    # jitter_cov_inv 和 h_sensitivity 已经是 NumPy 数组
+    """ 计算包含 SCR (自愈效应) 修正的 BCRLB """
     h_eff = h_sensitivity * scr
-
-    # 1. 抖动信息量 (NumPy 线性代数)
     j_jitter = np.dot(h_eff.T, np.dot(jitter_cov_inv, h_eff))
-
-    # 2. 热噪声信息量
     j_thermal = snr_linear * np.sum(h_sensitivity ** 2) * (scr ** 2)
-
     return np.sqrt(1.0 / (j_jitter + j_thermal))
 
 
-# --- 单次蒙特卡洛试验函数 ---
+# --- 单次蒙特卡洛试验函数 (集成相位噪声) ---
 def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true_v, hw_base_config, det_config):
     """
     执行单次仿真闭环：
-    宽带真值 -> 有色抖动 -> PA非线性 -> 热噪声 -> 对数检测器 -> GLRT估计
+    宽带真值 -> 有色抖动 + 相位噪声 -> PA非线性 -> 热噪声 -> 对数检测器 -> GLRT估计
     """
     np.random.seed(seed)
 
@@ -81,23 +64,30 @@ def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true
     hw_local = HardwareImpairments(hw_config)
     det_local = TerahertzDebrisDetector(fs, N, **det_config)
 
-    # 1. 生成有色 Jitter
+    # 1. 生成有色 Jitter (Amplitude)
     jitter = hw_local.generate_colored_jitter(N, fs)
     a_jitter = np.exp(jitter)
 
-    # 2. PA 非线性与自愈效应
-    pa_in = sig_broadband_truth * a_jitter
+    # 2. [关键修复] 生成相位噪声 (Phase)
+    theta_pn = hw_local.generate_phase_noise(N, fs)
+    phase_noise = np.exp(1j * theta_pn)
+
+    # 3. 物理互动: 信号受到幅度与相位的双重调制
+    # 这一步发生在进入 PA 之前
+    pa_in = sig_broadband_truth * a_jitter * phase_noise
+
+    # 4. PA 非线性 (包含自愈效应)
     pa_out, _, _ = hw_local.apply_saleh_pa(pa_in, ibo_dB=ibo)
 
-    # 3. 添加热噪声
+    # 5. 添加热噪声
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     y_rx = pa_out + w
 
-    # 4. 检测器处理
+    # 6. 检测器处理 (对数包络 + 投影)
     z_log = det_local.log_envelope_transform(y_rx)
     z_perp = det_local.apply_projection(z_log)
 
-    # 5. GLRT 速度搜索
+    # 7. GLRT 速度搜索
     v_scan = np.linspace(true_v - 1500, true_v + 1500, 31)
     stats = det_local.glrt_scan(z_perp, v_scan)
 
@@ -107,26 +97,20 @@ def run_trial(ibo, jitter_rms, seed, noise_std, sig_broadband_truth, N, fs, true
 
 
 def main():
-    # --- 修复: 尝试设置 multiprocessing start method ---
-    if multiprocessing.current_process().name == 'MainProcess' and multiprocessing.get_start_method(
-            allow_none=True) is None:
+    if multiprocessing.current_process().name == 'MainProcess':
         try:
-            # 'spawn' is more stable in Colab/Jupyter environment
             multiprocessing.set_start_method('spawn', force=True)
-            print("[INFO] Multiprocessing start method set to 'spawn' for stability.")
         except RuntimeError:
             pass
 
-    print("=== IEEE TWC Simulation: Fig 6 (RMSE vs SNR with Jitter Tiers) ===")
-    print("Initializing High-Fidelity Physics Simulation...")
+    print("=== IEEE TWC Simulation: Fig 6 (Hardware Sensitivity) ===")
     ensure_dir('results')
 
-    # --- CPU 核心数检测 ---
     num_cores = multiprocessing.cpu_count()
     n_jobs = max(1, num_cores - 2)
-    print(f"[INFO] Detected {num_cores} cores. Using {n_jobs} cores for CPU parallel processing.")
+    print(f"[INFO] Using {n_jobs} cores for parallel processing.")
 
-    # --- 1. 系统参数配置 ---
+    # --- 1. 系统参数 ---
     L_eff = 50e3
     fs = 20e3
     T_span = 0.05
@@ -134,63 +118,57 @@ def main():
     t_axis = np.linspace(-T_span / 2, T_span / 2, N)
     true_v = 15000.0
 
-    # 模块配置
     config_phy = {'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': 0.05, 'v_rel': true_v}
     config_hw_base = {'f_knee': 200.0, 'beta_a': 5995.0, 'alpha_a': 10.127}
     config_det = {'cutoff_freq': 300.0, 'L_eff': L_eff, 'a': 0.05}
 
-    # --- 2. 预计算：生成宽带物理真值 ---
-    print("Pre-computing Broadband Physics Signal (10GHz DFS)...")
+    # --- 2. 预计算 ---
+    print("Pre-computing Broadband Physics Signal...")
     phy = DiffractionChannel(config_phy)
     d_wb = phy.generate_broadband_chirp(t_axis, N_sub=64)
     sig_broadband_truth = 1.0 + d_wb
 
-    # 预计算 BCRLB 所需的灵敏度向量 h (NumPy)
     det_temp = TerahertzDebrisDetector(fs, N, **config_det)
     s_v = det_temp._generate_template(true_v)
     s_v_plus = det_temp._generate_template(true_v + 1.0)
-    h_vec = (s_v_plus - s_v) / 1.0  # 梯度
+    h_vec = (s_v_plus - s_v) / 1.0
 
-    # 噪声底校准
+    # 噪声底校准 (Linear region reference)
     hw_temp = HardwareImpairments(config_hw_base)
     pa_ref, _, _ = hw_temp.apply_saleh_pa(sig_broadband_truth, 15.0)
     p_ref = np.mean(np.abs(pa_ref) ** 2)
-    noise_std = np.sqrt(p_ref * 1e-5)
+    noise_std = np.sqrt(p_ref * 1e-5)  # 50dB Base SNR
     print(f"Calibrated Noise Floor (Std): {noise_std:.2e}")
 
-    # --- 3. 仿真扫描配置 ---
-    ibo_scan = np.linspace(15, -5, 15)
-    jitter_levels = [1e-6, 3e-6, 10e-6]
-    trials_per_point = 200
+    # --- 3. 仿真扫描: 硬件敏感度分析 ---
+    ibo_scan = np.linspace(15, -5, 11)  # 从线性区到饱和区
 
-    results = {}
-
-    plt.figure(figsize=(10, 7))
+    # [进阶] Jitter 曲线族
+    jitter_levels = [0.5e-6, 2.0e-6, 5.0e-6]
+    jitter_labels = ['SOTA (0.5urad)', 'Typical (2.0urad)', 'Poor (5.0urad)']
     colors = ['g', 'b', 'r']
 
-    # --- 4. 开始循环扫描 ---
-    for idx, j_rms in enumerate(jitter_levels):
-        print(f"\n--- Simulating Jitter Level: {j_rms * 1e6:.1f} urad ---")
+    trials_per_point = 200
+    results_dict = {'ibo': ibo_scan}
 
-        # 预计算该 Jitter 等级下的协方差矩阵 (NumPy)
+    fig, ax1 = plt.subplots(figsize=(10, 7))
+
+    for idx, (j_rms, label) in enumerate(zip(jitter_levels, jitter_labels)):
+        print(f"\n--- Simulating Curve: {label} ---")
+
+        # 计算理论协方差 (近似用于 BCRLB)
         hw_config_j = config_hw_base.copy()
         hw_config_j['jitter_rms'] = j_rms
         hw_j = HardwareImpairments(hw_config_j)
-
         long_jit = hw_j.generate_colored_jitter(N * 200, fs)
-        r_xx = np.correlate(long_jit, long_jit, mode='full')[
-                   len(long_jit) - 1: len(long_jit) - 1 + N] / len(long_jit)
-
-        # 修正后的协方差逆矩阵计算 (使用 sla.toeplitz 和 np.linalg.inv)
+        r_xx = np.correlate(long_jit, long_jit, mode='full')[len(long_jit) - 1: len(long_jit) - 1 + N] / len(long_jit)
         C_inv = np.linalg.inv(sla.toeplitz(r_xx) + np.eye(N) * 1e-12)
 
-        rmse_sim_list = []
-        bcrlb_theo_list = []
-        cap_curve = []
+        rmse_sim = []
+        bcrlb_theo = []
 
-        # IBO 扫描
-        for ibo in tqdm(ibo_scan, desc=f"Scanning Power (IBO)"):
-            # --- A. 理论值计算 ---
+        for ibo in tqdm(ibo_scan):
+            # A. 理论值
             _, scr_tr, _ = hw_j.apply_saleh_pa(sig_broadband_truth, ibo)
             scr = np.mean(scr_tr)
 
@@ -198,92 +176,46 @@ def main():
             p_sig = np.var(pa_out)
             snr_lin = p_sig / (noise_std ** 2)
 
-            p_tot = np.mean(np.abs(pa_out) ** 2)
-            comm_snr = p_tot / (noise_std ** 2)
-            cap = calc_capacity(comm_snr)
-            cap_curve.append(cap)
-
             bcrlb = calc_bcrlb(snr_lin, C_inv, h_vec, scr=scr)
-            bcrlb_theo_list.append(bcrlb)
+            bcrlb_theo.append(bcrlb)
 
-            # --- B. 并行蒙特卡洛仿真 ---
+            # B. 蒙特卡洛仿真
             seeds = np.random.randint(0, 1e9, trials_per_point)
-
-            # 增加 verbose=10 输出，帮助诊断 joblib 状态
-            errs = Parallel(n_jobs=n_jobs, verbose=10)(
-                delayed(run_trial)(
-                    ibo, j_rms, s, noise_std, sig_broadband_truth, N, fs, true_v, config_hw_base, config_det
-                ) for s in seeds
+            errs = Parallel(n_jobs=n_jobs)(
+                delayed(run_trial)(ibo, j_rms, s, noise_std, sig_broadband_truth, N, fs, true_v, config_hw_base,
+                                   config_det)
+                for s in seeds
             )
 
-            # 鲁棒统计 RMSE
             valid_errs = [e for e in errs if abs(e) < 1200]
             if len(valid_errs) > 10:
                 rmse = np.sqrt(np.mean(np.array(valid_errs) ** 2))
             else:
-                rmse = 1000.0
+                rmse = 1000.0  # 失锁
+            rmse_sim.append(rmse)
 
-            rmse_sim_list.append(rmse)
+        # 绘图
+        ax1.semilogy(ibo_scan, rmse_sim, f'{colors[idx]}o-', label=f'Sim: {label}')
+        ax1.semilogy(ibo_scan, bcrlb_theo, f'{colors[idx]}--', alpha=0.5)
 
-        # 绘制该 Jitter 等级的曲线
-        label = r"$" + f"{j_rms * 1e6:.0f}" + r"\ \mu\text{rad}$"  # 修复: 使用 Raw String 和 LaTeX 语法
-        plt.semilogy(ibo_scan, rmse_sim_list, f'{colors[idx]}o-', label=f'Sim: Jitter={label}', markersize=5)
-        plt.semilogy(ibo_scan, bcrlb_theo_list, f'{colors[idx]}--', linewidth=1.5, alpha=0.6,
-                     label='BCRLB' if idx == 0 else "")  # 仅为第一条理论线添加标签
+        # 存储数据
+        results_dict[f'rmse_{idx}'] = rmse_sim
+        results_dict[f'bcrlb_{idx}'] = bcrlb_theo
 
-        # 存储结果 (为 CSV 准备)
-        results[f"rmse_sim_{label}"] = rmse_sim_list
-        results[f"bcrlb_{label}"] = bcrlb_theo_list
-        # Capacity 只需存储一次
-        if idx == 0:
-            results[f"capacity"] = cap_curve
-
-    # --- 5. 绘图修饰 (双轴图) ---
-    ax1 = plt.gca()
-    # 修复: 使用 Raw String 和正确的 LaTeX 语法
-    ax1.set_xlabel(r'Input Back-Off (dB) [High Power $\leftarrow$]')
-    ax1.set_ylabel('Ranging RMSE (m/s)', color='k')
+    ax1.set_xlabel(r'Input Back-Off (dB) [$\leftarrow$ High Power]')
+    ax1.set_ylabel('Ranging RMSE (m/s)')
     ax1.invert_xaxis()
     ax1.grid(True, which='both', linestyle=':')
+    ax1.set_ylim(50, 2000)
+    ax1.legend(loc='best', title="Platform Stability")
 
-    # [可视化 FIX 1] Y 轴范围调整 (隐藏 1000.0 的失败点，聚焦于有效数据)
-    ax1.set_ylim(50, 1500)
-
-    # 右轴：通信容量 (Capacity)
-    ax2 = ax1.twinx()
-    line_cap, = ax2.plot(ibo_scan, cap_curve, 'k-s', alpha=0.3, linewidth=8, label='Comm Capacity')
-    ax2.set_ylabel('Spectral Efficiency (bits/s/Hz)', color='gray')
-    ax2.tick_params(axis='y', labelcolor='gray')
-
-    # [可视化 FIX 2] 图例合并与定位调整 (移到右下角或最佳位置)
-    lines_rmse = [line for line in ax1.lines]
-    lines_cap = [line_cap]
-
-    legend_elements = lines_rmse + lines_cap
-    legend_labels = [l.get_label() for l in legend_elements]
-    # 使用 loc='lower center' 或 'best'
-    ax1.legend(legend_elements, legend_labels, loc='lower center', ncol=2, fancybox=True, shadow=True, title="Legend")
-
-    plt.title('Fig 6: ISAC Performance Trade-off & Error Floor Verification')
+    plt.title('Fig 6: Hardware Sensitivity Analysis (Jitter & PA)')
     plt.tight_layout()
+    plt.savefig('results/Fig6_Hardware_Sensitivity.png', dpi=300)
+    plt.savefig('results/Fig6_Hardware_Sensitivity.pdf', format='pdf')
 
-    # --- 6. 保存结果 ---
-    plot_path = 'results/Fig6_RMSE_vs_SNR_MultiJitter'
-    plt.savefig(f'{plot_path}.png', dpi=300)
-    plt.savefig(f'{plot_path}.pdf', format='pdf')
-
-    # [CSV FIX] 保存数值数据 (CSV) - 确保路径在 csv_data/
-    results['ibo'] = ibo_scan
-
-    # 构造 CSV 数据字典
-    csv_data_dict = {'ibo': results['ibo'], 'capacity': results['capacity']}
-    for k in results.keys():
-        if k not in ['ibo', 'capacity']:
-            csv_data_dict[k] = results[k]
-
-    save_csv(csv_data_dict, 'Fig6_data')
-
-    print(f"\n[Success] Fig 6 Generated. Data saved to results/csv_data/Fig6_data.csv")
+    save_csv(results_dict, 'Fig6_Sensitivity_Data')
+    print("\n[Success] Fig 6 generated.")
 
 
 if __name__ == "__main__":

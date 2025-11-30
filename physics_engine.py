@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------------------
 # 脚本名称: physics_engine.py
-# 版本: v3.0 (Numba Ready & Vectorized)
+# 版本: v3.1 (Fixed: Restored 'generate_diffraction_pattern' for Fig 3)
 # ----------------------------------------------------------------------------------
 
 import numpy as np
@@ -32,55 +32,9 @@ class DiffractionChannel:
         self.v_rel = config.get('v_rel', 15000)
         self.c = 299792458.0
 
-    def generate_broadband_chirp(self, t_axis, N_sub=32):
-        """
-        宽带离散频率求和 (DFS) - 物理层核心
-        """
-        # 1. 频率网格
-        freqs = np.linspace(self.fc - self.B / 2, self.fc + self.B / 2, N_sub)
-
-        # 2. 空间参数矩阵化 (Vectorization)
-        # freqs: (N_sub, 1)
-        # t_axis: (1, N_t)
-        freqs_col = freqs.reshape(-1, 1)
-        t_row = t_axis.reshape(1, -1)
-
-        lam_col = self.c / freqs_col
-        rho_t = self.v_rel * np.abs(t_row)
-
-        # Lommel 变量 u, v
-        # u 是常数(对时间)，但随频率变化
-        u_k = (2 * np.pi * self.a ** 2) / (lam_col * self.L_eff)
-        # v 随时间和频率变化
-        v_k = (2 * np.pi * self.a * rho_t) / (lam_col * self.L_eff)
-
-        # 3. 计算 Lommel 函数 (耗时核心)
-        if HAS_NUMBA:
-            # 展平数组以喂给 Numba (如果需要极致优化，这里可以进一步展开)
-            # 但目前的 Numpy 向量化已经足够快，这里保持兼容性
-            U1, U2 = self._lommel_series_numpy(u_k, v_k)
-        else:
-            U1, U2 = self._lommel_series_numpy(u_k, v_k)
-
-        # 4. 合成衍射场
-        # 二次相位项 (Chirp 本质)
-        quad_phase = np.exp(1j * (v_k ** 2) / (2 * u_k))
-        phase_term = np.exp(-1j * u_k / 2)
-
-        d_k_matrix = phase_term * (U1 + 1j * U2) * quad_phase
-
-        # 5. 基带旋转与叠加
-        delta_f = (freqs - self.fc).reshape(-1, 1)
-        time_phase_matrix = np.exp(1j * 2 * np.pi * delta_f * t_row)
-
-        # 相干累加
-        broadband_signal = np.sum(d_k_matrix * time_phase_matrix, axis=0) / N_sub
-
-        return broadband_signal
-
     def _lommel_series_numpy(self, u, v, max_terms=40):
         """
-        高度向量化的 Numpy 实现，无需显式循环处理数组元素
+        高度向量化的 Numpy 实现
         """
         v_safe = np.maximum(v, 1e-5)
         ratio = u / v_safe
@@ -88,10 +42,8 @@ class DiffractionChannel:
         U1 = np.zeros_like(v, dtype=np.complex128)
         U2 = np.zeros_like(v, dtype=np.complex128)
 
-        # 级数求和循环 (无法避免，但只有 40 次，开销很小)
         for m in range(max_terms):
             sign = (-1.0) ** m
-            # scipy.special.jv 支持数组输入
             bessel_1 = sp.jv(1 + 2 * m, v_safe)
             bessel_2 = sp.jv(2 + 2 * m, v_safe)
 
@@ -102,3 +54,52 @@ class DiffractionChannel:
             U2 += sign * pow_2 * bessel_2
 
         return U1, U2
+
+    def generate_diffraction_pattern(self, t_axis, freqs):
+        """
+        [RESTORED] 生成特定频率下的衍射调制信号 (矩阵输出)
+        用于 Fig 3 窄带 vs 宽带对比分析
+        输出: (N_freqs, N_time) 复数矩阵
+        """
+        freqs = np.atleast_1d(freqs)
+
+        # 空间参数矩阵化
+        freqs_col = freqs.reshape(-1, 1)
+        t_row = t_axis.reshape(1, -1)
+
+        lam_col = self.c / freqs_col
+        rho_t = self.v_rel * np.abs(t_row)
+
+        u_k = (2 * np.pi * self.a ** 2) / (lam_col * self.L_eff)
+        v_k = (2 * np.pi * self.a * rho_t) / (lam_col * self.L_eff)
+
+        # 计算 Lommel
+        U1, U2 = self._lommel_series_numpy(u_k, v_k)
+
+        # 合成场 (含二次相位)
+        quad_phase = np.exp(1j * (v_k ** 2) / (2 * u_k))
+        phase_term = np.exp(-1j * u_k / 2)
+
+        d_k_matrix = phase_term * (U1 + 1j * U2) * quad_phase
+
+        return d_k_matrix
+
+    def generate_broadband_chirp(self, t_axis, N_sub=32):
+        """
+        宽带离散频率求和 (DFS)
+        """
+        # 1. 频率网格
+        freqs = np.linspace(self.fc - self.B / 2, self.fc + self.B / 2, N_sub)
+
+        # 2. 调用复原的矩阵生成函数 (复用逻辑)
+        d_k_matrix = self.generate_diffraction_pattern(t_axis, freqs)
+
+        # 3. 基带旋转与叠加
+        delta_f = (freqs - self.fc).reshape(-1, 1)
+        t_row = t_axis.reshape(1, -1)
+        time_phase_matrix = np.exp(1j * 2 * np.pi * delta_f * t_row)
+
+        # 相干累加
+        broadband_signal = np.sum(d_k_matrix * time_phase_matrix, axis=0) / N_sub
+
+        return broadband_signal

@@ -6,6 +6,7 @@ import os
 import pandas as pd
 from tqdm import tqdm
 
+# 导入模块
 try:
     from physics_engine import DiffractionChannel
     from hardware_model import HardwareImpairments
@@ -21,10 +22,11 @@ def ensure_dir(d):
 
 
 def save_csv(data_dict, filename, folder='results/csv_data'):
+    """ 标准化 CSV 保存函数 """
     if not os.path.exists(folder): os.makedirs(folder)
     df = pd.DataFrame(data_dict)
     df.to_csv(f"{folder}/{filename}.csv", index=False)
-    print(f"   [Data] Saved {filename}.csv")
+    print(f"   [Data] Saved {filename}.csv to {folder}")
 
 
 # --- 公共配置 ---
@@ -35,17 +37,18 @@ N = int(fs * T_span)
 t_axis = np.linspace(-T_span / 2, T_span / 2, N)
 true_v = 15000.0
 
+# 硬件配置
 config_hw = {'jitter_rms': 2.0e-6, 'f_knee': 200.0, 'beta_a': 5995.0, 'alpha_a': 10.127}
-# 检测器使用固定的参考尺寸 a=0.05m 进行归一化
+# 检测器配置 (模板使用固定参考尺寸 a=0.05m，模拟真实场景中模板可能不完全匹配尺寸的情况，或假设为点目标)
 config_det = {'cutoff_freq': 300.0, 'L_eff': L_eff, 'a': 0.05}
 
 num_cores = multiprocessing.cpu_count()
 n_jobs = max(1, num_cores - 2)
 
 
-# ==========================================
-# Task 1: Fig 8 - 最小可探测尺寸 (MDS)
-# ==========================================
+# =========================================================================
+# Task 1: Fig 8 - 探测能力边界 / 最小可探测尺寸 (MDS)
+# =========================================================================
 
 def get_h0_stat(seed, noise_std):
     """ H0 (无目标) 仿真: 获取噪声背景下的检测统计量以确定门限 """
@@ -62,11 +65,9 @@ def get_h0_stat(seed, noise_std):
     pa_out, _, _ = hw.apply_saleh_pa(pa_in, ibo_dB=10.0)  # 线性区工作
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
 
-    # 检测流程
     z_log = det.log_envelope_transform(pa_out + w)
     z_perp = det.apply_projection(z_log)
 
-    # 用标准模板匹配
     s_temp = det.P_perp @ det._generate_template(true_v)
     denom = np.sum(s_temp ** 2)
     if denom < 1e-15: return 0.0
@@ -81,7 +82,7 @@ def get_h1_stat(a_val, seed, noise_std):
     hw = HardwareImpairments(config_hw)
     det = TerahertzDebrisDetector(fs, N, **config_det)
 
-    # 物理引擎: 设置当前扫描的半径 a_val
+    # 物理引擎: 设置当前扫描的半径 a_val (决定 FSCS 强度)
     phy_conf = {'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': a_val, 'v_rel': true_v}
     phy = DiffractionChannel(phy_conf)
 
@@ -100,6 +101,7 @@ def get_h1_stat(a_val, seed, noise_std):
     z_log = det.log_envelope_transform(pa_out + w)
     z_perp = det.apply_projection(z_log)
 
+    # 匹配滤波
     s_temp = det.P_perp @ det._generate_template(true_v)
     denom = np.sum(s_temp ** 2)
     stat = (np.dot(s_temp, z_perp) ** 2) / denom
@@ -107,7 +109,7 @@ def get_h1_stat(a_val, seed, noise_std):
 
 
 def run_fig8_mds():
-    print("\n--- Running Fig 8: Minimum Detectable Size (MDS) ---")
+    print("\n=== Running Task 1: Fig 8 (Minimum Detectable Size) ===")
 
     # 1. 确定门限 (Pfa = 1e-3, 实际上 TWC 需要 1e-6, 为速度做近似)
     print("Step 1: Establishing CFAR Threshold (Pfa=1e-3)...")
@@ -144,6 +146,7 @@ def run_fig8_mds():
 
     # 标注 MDS 点 (Pd > 0.5)
     pd_array = np.array(pd_curve)
+    # 找到第一个大于 0.5 的点
     cross_indices = np.where(pd_array > 0.5)[0]
     if len(cross_indices) > 0:
         mds_d = diameters_mm[cross_indices[0]]
@@ -159,13 +162,13 @@ def run_fig8_mds():
     plt.savefig('results/Fig8_Detection_Capability.png', dpi=300)
     plt.savefig('results/Fig8_Detection_Capability.pdf', format='pdf')
 
-    # 保存数据
+    # 保存数据到指定目录
     save_csv({'diameter_mm': diameters_mm, 'pd': pd_curve}, 'Fig8_MDS_Data')
 
 
-# ==========================================
+# =========================================================================
 # Task 2: Fig 9 - 通感一体化权衡 (ISAC Trade-off)
-# ==========================================
+# =========================================================================
 
 def run_isac_trial_single(ibo, seed, noise_std, sig_truth):
     """ 单次试验: 返回 (Capacity, RMSE) """
@@ -183,7 +186,6 @@ def run_isac_trial_single(ibo, seed, noise_std, sig_truth):
 
     # 3. 指标 A: 通信容量
     # Capacity = log2(1 + SNR_out)
-    # 实际上应计算 SINR，这里简化为输出信噪比
     p_rx = np.mean(np.abs(pa_out) ** 2)
     snr_lin = p_rx / (noise_std ** 2)
     capacity = np.log2(1 + snr_lin)
@@ -195,9 +197,9 @@ def run_isac_trial_single(ibo, seed, noise_std, sig_truth):
     z_log = det.log_envelope_transform(y_rx)
     z_perp = det.apply_projection(z_log)
 
+    # 局部 GLRT 扫描 (简化版)
     v_scan = np.linspace(true_v - 1500, true_v + 1500, 41)
 
-    # 局部 GLRT 扫描
     stats = []
     for v in v_scan:
         s_raw = det._generate_template(v)
@@ -212,9 +214,9 @@ def run_isac_trial_single(ibo, seed, noise_std, sig_truth):
 
 
 def run_fig9_isac():
-    print("\n--- Running Fig 9: ISAC Trade-off Analysis ---")
+    print("\n=== Running Task 2: Fig 9 (ISAC Trade-off) ===")
 
-    # 预计算物理信号
+    # 预计算物理信号 (此时尺寸固定 a=0.05)
     phy = DiffractionChannel({'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': 0.05, 'v_rel': true_v})
     d_wb = phy.generate_broadband_chirp(t_axis, N_sub=32)
     sig_truth = 1.0 + d_wb
@@ -270,16 +272,18 @@ def run_fig9_isac():
     plt.savefig('results/Fig9_ISAC_Tradeoff.png', dpi=300)
     plt.savefig('results/Fig9_ISAC_Tradeoff.pdf', format='pdf')
 
-    # 保存数据
+    # 保存数据到指定目录
     save_csv({'ibo': ibo_points, 'capacity': avg_cap, 'rmse': avg_rmse}, 'Fig9_ISAC_Data')
 
 
 if __name__ == "__main__":
-    ensure_dir('results/csv_data')
+    ensure_dir('results')
+    ensure_dir('results/csv_data')  # 确保子目录存在
+
     multiprocessing.freeze_support()
 
-    # 依次执行
+    # 依次执行两个任务
     run_fig8_mds()
     run_fig9_isac()
 
-    print("\n[Done] Advanced metrics generated successfully.")
+    print("\n[Done] All advanced metrics generated. Check 'results/csv_data/' for data.")

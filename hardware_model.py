@@ -3,7 +3,7 @@ import numpy as np
 
 class HardwareImpairments:
     """
-    IEEE TWC 级别硬件损伤仿真引擎 (v2.0 Final)
+    IEEE TWC 级别硬件损伤仿真引擎 (v2.1 Final)
     包含：
     1. 有色幅度抖动 (Colored Jitter) - 机械微振动
     2. 相位噪声 (Phase Noise) - 振荡器 Leeson 模型

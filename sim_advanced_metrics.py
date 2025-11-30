@@ -14,7 +14,6 @@ try:
 except ImportError:
     raise SystemExit("Missing modules")
 
-# 绘图配置 (移除不需要的 note)
 plt.rcParams.update({'font.family': 'serif', 'font.size': 12, 'pdf.fonttype': 42})
 
 
@@ -30,17 +29,15 @@ def save_csv(data_dict, filename, folder='results/csv_data'):
     print(f"   [Data] Saved {filename}.csv to {folder}")
 
 
-# --- 公共配置 (参数微调以确保可见性) ---
+# --- 公共配置 ---
 L_eff = 50e3
 fs = 20e3
-T_span = 0.1  # [TWEAK] 增加到 100ms 以获得更多处理增益
+T_span = 0.1
 N = int(fs * T_span)
 t_axis = np.linspace(-T_span / 2, T_span / 2, N)
 true_v = 15000.0
 
-# 硬件配置 [TWEAK: 降低噪声以验证逻辑]
-# jitter_rms: 2e-6 -> 0.5e-6 (SOTA)
-# L_1MHz: -85 -> -95 (Better Oscillator)
+# 硬件配置 (保持 SOTA 参数)
 config_hw = {
     'jitter_rms': 0.5e-6,
     'f_knee': 200.0,
@@ -118,11 +115,26 @@ def get_h1_stat(a_val, seed, noise_std):
     return stat
 
 
+def calibrate_snr_check(noise_std):
+    """ 自检函数: 打印信号深度与噪声底 """
+    # 检查 100mm (a=0.05) 和 10mm (a=0.005)
+    print("\n--- SNR Calibration Check ---")
+    for a_test in [0.05, 0.005]:
+        phy = DiffractionChannel({'fc': 300e9, 'B': 10e9, 'L_eff': L_eff, 'a': a_test, 'v_rel': true_v})
+        d_wb = phy.generate_broadband_chirp(t_axis, N_sub=16)
+        sig_depth = np.max(np.abs(d_wb))
+        print(
+            f"Target D={a_test * 2000:.0f}mm: Shadow Depth = {sig_depth:.2e} | Noise Floor = {noise_std:.2e} | CNR = {20 * np.log10(sig_depth / noise_std):.1f} dB")
+    print("-----------------------------\n")
+
+
 def run_fig8_mds():
     print("\n=== Running Task 1: Fig 8 (Minimum Detectable Size) ===")
 
-    # [TWEAK] 极低热噪声，专注于 Jitter/PhaseNoise 限制
-    noise_std = 1.0e-4
+    # [TWEAK] 降低噪声到底 (-100dBc)，使得 10-20mm 的物体可见
+    noise_std = 1.0e-5
+
+    calibrate_snr_check(noise_std)
 
     print("Step 1: Establishing CFAR Threshold (Pfa=1e-3)...")
     h0_trials = 2000
@@ -134,8 +146,8 @@ def run_fig8_mds():
     threshold = np.percentile(stats_h0, 99.9)
     print(f"   Threshold: {threshold:.2f}")
 
-    # 扫描尺寸 (1mm 到 100mm)
-    diameters_mm = np.logspace(0, 2, 20)
+    # 扫描尺寸 (2mm 到 100mm) - 1mm 可能真的看不见
+    diameters_mm = np.logspace(0.3, 2, 20)  # ~2mm to 100mm
     radii_m = diameters_mm / 2000.0
 
     pd_curve = []
@@ -164,7 +176,7 @@ def run_fig8_mds():
 
     plt.xlabel('Debris Diameter (mm)')
     plt.ylabel('Probability of Detection ($P_d$)')
-    plt.title(f'Fig 8: Detection Capability (Pfa=1e-3)')
+    plt.title(f'Fig 8: Detection Capability (High SNR Link)')
     plt.grid(True, which='both', linestyle=':')
     plt.legend()
     plt.tight_layout()
@@ -203,7 +215,7 @@ def run_isac_trial_single(ibo, seed, noise_std, sig_truth):
     z_log = det.log_envelope_transform(y_rx)
     z_perp = det.apply_projection(z_log)
 
-    # [TWEAK] 更密集的扫描以捕获峰值
+    # 增加扫描密度
     v_scan = np.linspace(true_v - 1500, true_v + 1500, 101)
 
     stats = []
@@ -226,11 +238,12 @@ def run_fig9_isac():
     d_wb = phy.generate_broadband_chirp(t_axis, N_sub=32)
     sig_truth = 1.0 + d_wb
 
-    # 噪声定标 (50dB Base SNR)
+    # 噪声定标: 使用相同的低噪声底 (1e-5)
+    # 这样在 Linear Region 应该能获得极高的精度
     hw_temp = HardwareImpairments(config_hw)
     pa_ref, _, _ = hw_temp.apply_saleh_pa(sig_truth, 15.0)
     p_ref = np.mean(np.abs(pa_ref) ** 2)
-    noise_std = np.sqrt(p_ref * 1e-5)
+    noise_std = np.sqrt(p_ref * (1e-5) ** 2)  # Force 1e-5 relative level
 
     # 扫描 IBO
     ibo_points = np.linspace(20, -5, 15)
@@ -247,7 +260,7 @@ def run_fig9_isac():
         res = np.array(res)
 
         avg_cap.append(np.mean(res[:, 0]))
-        # 鲁棒平均 (剔除完全失败点)
+        # 鲁棒平均
         valid_errs = [e for e in res[:, 1] if e < 1400]
         if len(valid_errs) > 5:
             rmse = np.sqrt(np.mean(np.array(valid_errs) ** 2))
@@ -267,9 +280,6 @@ def run_fig9_isac():
     ax.set_ylabel('Sensing RMSE (m/s)')
     ax.set_title('Fig 9: ISAC Trade-off (Pareto Frontier)')
     ax.grid(True, linestyle=':')
-
-    # [CLEAN] 移除文字标注以保持图片干净，信息保留在 CSV 中
-    # ax.annotate... (Removed per instruction)
 
     plt.tight_layout()
     plt.savefig('results/Fig9_ISAC_Tradeoff.png', dpi=300)

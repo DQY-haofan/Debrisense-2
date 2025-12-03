@@ -130,7 +130,7 @@ def step1_ideal_awgn_glrt(d, t_axis):
     plt.ylabel("Test Statistic")
     plt.grid(True)
     plt.legend()
-    plt.show()  # 如果是本地运行，这会弹窗；在agent环境里可能无法直接看到，但代码逻辑已验证
+    # plt.show() # Agent环境注释掉
 
     if abs(v_hat - v_true) < 100 and contrast > 2.0:
         print(">>> SUCCESS: Ideal GLRT is working correctly! <<<")
@@ -144,7 +144,11 @@ def step2_hardware_impairments(d, t_axis):
     print("\n=== Step 2: Hardware Impairments Stress Test ===")
     fs = GLOBAL_CONFIG['fs']
     N = len(t_axis)
-    det = TerahertzDebrisDetector(fs, N, cutoff_freq=300.0, N_sub=32)
+    # [FIX] 必须传入 L_eff 和 a 等物理参数，否则使用错误的默认值(500km)会导致匹配失败
+    det = TerahertzDebrisDetector(fs, N, cutoff_freq=300.0,
+                                  L_eff=GLOBAL_CONFIG['L_eff'],
+                                  a=GLOBAL_CONFIG['a_default'],
+                                  N_sub=32)
     hw = HardwareImpairments(HW_CONFIG)
 
     sig_truth = 1.0 - d

@@ -120,7 +120,7 @@ def step1_ideal_awgn_glrt(d, t_axis):
 
     print(f"[Result] True v: {v_true}, Est v: {v_hat}")
     print(f"[Result] RMSE: {abs(v_hat - v_true):.2f} m/s")
-    print(f"[Result] Peak Value: {peak_val:.2f}, Contrast (vs side): {contrast:.2f}")
+    print(f"[Result] Peak Value: {peak_val:.3e}, Contrast (vs side): {contrast:.2f}")
 
     plt.figure(figsize=(6, 4))
     plt.plot(v_scan, glrt_stats, 'b-o')
@@ -200,7 +200,7 @@ def step2_hardware_impairments(d, t_axis):
         rmse = abs(v_hat - v_true)
         peak = np.max(stats)
 
-        print(f"{name:<15} | {rmse:<10.1f} | {peak:<10.2f}")
+        print(f"{name:<15} | {rmse:<10.1f} | {peak:<10.3e}")
 
 
 if __name__ == "__main__":

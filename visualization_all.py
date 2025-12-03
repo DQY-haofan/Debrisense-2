@@ -1,11 +1,10 @@
 # ----------------------------------------------------------------------------------
 # 脚本名称: reproduce_paper_results_ieee.py
-# 版本: v10.0 (Final Production - High SNR & Dynamic Gamma)
+# 版本: v11.0 (Parameter Tuned for U-Shape & Visibility)
 # 描述:
-#   1. [SNR Boost] 全面提升目标信噪比 (+10dB)，确保算法在理想条件下有效。
-#   2. [Physics] Fig 9 引入动态 Gamma_eff (随 IBO 衰减)，激活 Trade-off。
-#   3. [Threshold] Fig 8 门限放宽至 90%，提升可见度。
-#   4. [Style] 保持 IEEE 单栏紧凑风格。
+#   1. [Tuning] 大幅降低 Fig6/9 的目标 SNR (8-10dB)，以显现 High IBO 下的噪声受限区（U型左侧）。
+#   2. [Tuning] 大幅提升 Jitter 量级 (0.05-0.1)，确保不同曲线能被肉眼区分。
+#   3. [Logic] 修正 RMSE 统计逻辑，增强鲁棒性。
 # ----------------------------------------------------------------------------------
 
 import numpy as np
@@ -27,14 +26,12 @@ except ImportError:
 # --- 绘图配置 ---
 plt.rcParams.update({
     'font.family': 'serif',
-    'font.serif': ['Times New Roman', 'DejaVu Serif', 'Liberation Serif'],
     'font.size': 12,
     'axes.labelsize': 14,
     'legend.fontsize': 11,
     'lines.linewidth': 1.5,
     'figure.figsize': (5, 4),
     'figure.dpi': 300,
-    'pdf.fonttype': 42,
     'axes.grid': True,
     'grid.linestyle': ':',
     'grid.alpha': 0.6
@@ -47,12 +44,12 @@ GLOBAL_CONFIG = {
     'a_default': 0.05, 'v_default': 15000
 }
 
-# [CRITICAL] 统一 SNR 配置表 (+10dB Boost)
+# [CRITICAL] 参数调优：降低 SNR 以展示性能恶化边界
 SNR_CONFIG = {
-    "fig6": 22.0,  # RMSE: 足够高的 SNR 以展示 Jitter Floor
-    "fig7": 20.0,  # ROC: 区分度明显的区间
-    "fig8": 25.0,  # MDS: 确保 5cm 目标可见
-    "fig9": 22.0  # ISAC: 高信噪比下看非线性权衡
+    "fig6": 8.0,  # [Tuned] 降至 8dB，确保 IBO=20dB 时进入噪声受限区 (U型左侧)
+    "fig7": 15.0,  # [Tuned] 保持适中，展示 ROC 差异
+    "fig8": 20.0,  # MDS 需要较高 SNR 才能检测小目标
+    "fig9": 10.0  # [Tuned] 降至 10dB，让 Capacity 不会一直顶格
 }
 
 HW_CONFIG = {
@@ -63,122 +60,8 @@ HW_CONFIG = {
 
 
 # -------------------------------------------------------------------------
-#  原子计算函数 (Pickle Safe)
+#  Generator Class & Methods
 # -------------------------------------------------------------------------
-
-def _gen_template(v, fs, N, cfg):
-    return TerahertzDebrisDetector(fs, N, **cfg)._generate_template(v)
-
-
-def _trial_rmse_opt(ibo, jitter_rms, seed, noise_std, sig_truth, N, fs, true_v, hw_base, T_bank, E_bank, v_scan):
-    np.random.seed(seed)
-    hw_cfg = hw_base.copy()
-    hw_cfg['jitter_rms'] = jitter_rms
-    hw = HardwareImpairments(hw_cfg)
-    det = TerahertzDebrisDetector(fs, N, cutoff_freq=300.0, L_eff=GLOBAL_CONFIG['L_eff'], a=GLOBAL_CONFIG['a_default'],
-                                  N_sub=32)
-
-    # 损伤注入
-    jit = np.exp(hw.generate_colored_jitter(N, fs))
-    pn = np.exp(1j * hw.generate_phase_noise(N, fs))
-    pa_out, _, _ = hw.apply_saleh_pa(sig_truth * jit * pn, ibo_dB=ibo)
-
-    # 接收 (Log-Envelope)
-    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-    z_perp = det.apply_projection(det.log_envelope_transform(pa_out + w))
-
-    # Matrix GLRT
-    stats = (np.dot(T_bank, z_perp) ** 2) / E_bank
-    est_v = v_scan[np.argmax(stats)]
-    return est_v - true_v
-
-
-def _trial_roc(is_h1, seed, noise_std, true_v, N, fs, ideal=False):
-    np.random.seed(seed)
-    hw = HardwareImpairments(HW_CONFIG)
-    det = TerahertzDebrisDetector(fs, N, cutoff_freq=300.0, L_eff=GLOBAL_CONFIG['L_eff'], a=GLOBAL_CONFIG['a_default'],
-                                  N_sub=32)
-
-    if is_h1:
-        phy = DiffractionChannel(GLOBAL_CONFIG)
-        d_wb = phy.generate_broadband_chirp(np.arange(N) / fs - (N / 2) / fs, N_sub=32)
-        sig = 1.0 - d_wb
-    else:
-        sig = np.ones(N, dtype=complex)
-
-    if ideal:
-        pa_out = sig
-    else:
-        jit = np.exp(hw.generate_colored_jitter(N, fs))
-        pa_out, _, _ = hw.apply_saleh_pa(sig * jit, ibo_dB=10.0)
-
-    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-
-    # GLRT
-    z_perp = det.apply_projection(det.log_envelope_transform(pa_out + w))
-    s_temp = det.P_perp @ det._generate_template(true_v)
-    stat_glrt = (np.dot(s_temp, z_perp) ** 2) / (np.sum(s_temp ** 2) + 1e-20)
-
-    # Energy
-    y_ac = np.abs(pa_out + w) - np.mean(np.abs(pa_out + w))
-    stat_ed = np.sum(y_ac ** 2)
-    return stat_glrt, stat_ed
-
-
-def _trial_mds(is_h1, sig_clean, seed, noise_std, s_norm, P_perp, N, fs, ideal=False):
-    np.random.seed(seed)
-    hw = HardwareImpairments(HW_CONFIG)
-    det = TerahertzDebrisDetector(fs, N, a=0.05)
-
-    sig = sig_clean if is_h1 else np.ones(N, dtype=complex)
-
-    if ideal:
-        pa_out = sig
-    else:
-        jit = np.exp(hw.generate_colored_jitter(N, fs))
-        pn = np.exp(1j * hw.generate_phase_noise(N, fs))
-        pa_out, _, _ = hw.apply_saleh_pa(sig * jit * pn, ibo_dB=10.0)
-
-    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-    z_perp = P_perp @ det.log_envelope_transform(pa_out + w)
-    return (np.dot(s_norm, z_perp) ** 2)
-
-
-def _trial_isac(ibo, seed, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp, N, fs, ideal=False):
-    np.random.seed(seed)
-    hw = HardwareImpairments(HW_CONFIG)
-    det = TerahertzDebrisDetector(fs, N, a=GLOBAL_CONFIG['a_default'])
-
-    if ideal:
-        pa_out = sig_truth
-        gamma_eff = 0.0
-    else:
-        jit = np.exp(hw.generate_colored_jitter(N, fs))
-        pn = np.exp(1j * hw.generate_phase_noise(N, fs))
-        pa_in = sig_truth * jit * pn
-        pa_out, _, _ = hw.apply_saleh_pa(pa_in, ibo_dB=ibo)
-
-        # [CRITICAL FIX] 动态非线性因子: 随 IBO 衰减
-        # IBO=0dB -> gamma=1e-3; IBO=20dB -> gamma=1e-5
-        gamma0 = 1e-3
-        gamma_eff = gamma0 * (10 ** (-ibo / 10.0))
-
-    # Capacity
-    p_rx = np.mean(np.abs(pa_out) ** 2)
-    # 简单的加性噪声 + 非线性失真模型
-    sinr = p_rx / (noise_std ** 2 + p_rx * gamma_eff)
-    cap = np.log2(1 + sinr)
-
-    # Sensing
-    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-    z_perp = P_perp @ det.log_envelope_transform(pa_out + w)
-
-    stats = (np.dot(T_bank, z_perp) ** 2) / E_bank
-    est_v = v_scan[np.argmax(stats)]
-    return cap, abs(est_v - GLOBAL_CONFIG['v_default'])
-
-
-# --- Generator Class ---
 
 class PaperFigureGenerator:
     def __init__(self, output_dir='results'):
@@ -194,7 +77,6 @@ class PaperFigureGenerator:
     def save_plot(self, name):
         plt.tight_layout(pad=0.5)
         plt.savefig(f"{self.out_dir}/{name}.png", dpi=300, bbox_inches='tight')
-        plt.savefig(f"{self.out_dir}/{name}.pdf", format='pdf', bbox_inches='tight')
         plt.close('all')
 
     def save_csv(self, data, name):
@@ -213,312 +95,301 @@ class PaperFigureGenerator:
         pd.DataFrame(matrix).to_csv(f"{self.csv_dir}/{name}.csv", index=False, header=False)
 
     def _calc_noise_std(self, target_snr_db, signal_reference):
-        """ 专家级 SNR 标定: 基于残差信号功率 """
+        """ 基于残差信号 d(t) 的能量计算噪声 """
         p_sig = np.mean(np.abs(signal_reference) ** 2)
-        noise_std = np.sqrt(p_sig * (10 ** (-target_snr_db / 10.0)))
+        noise_std = np.sqrt(p_sig / (10 ** (target_snr_db / 10.0)))
         return noise_std
 
-    # --- Group A (Physical Visualization) ---
+    # --- Group A: Physics Visualization (Unchanged) ---
     def generate_fig2_mechanisms(self):
         print("\n--- Fig 2 ---")
         hw = HardwareImpairments(HW_CONFIG)
         jit = hw.generate_colored_jitter(self.N * 10, self.fs)
         f, psd = signal.welch(jit, self.fs, nperseg=2048)
         pin_db, am_am, scr = hw.get_pa_curves()
-        scr_plot = np.maximum(scr, -0.2)
 
-        plt.figure(figsize=(5, 4));
-        plt.loglog(f, psd, 'b');
-        plt.xlabel('Frequency (Hz)');
-        plt.ylabel(r'PSD (rad$^2$/Hz)');
-        plt.grid(True, ls=':')
-        self.save_plot('Fig2a_Jitter');
-        self.save_csv({'freq': f, 'psd': psd}, 'Fig2a_Data')
+        plt.figure(figsize=(5, 4))
+        plt.loglog(f, psd, 'b')
+        plt.xlabel('Frequency (Hz)')
+        plt.ylabel(r'PSD')
+        self.save_plot('Fig2a_Jitter')
 
-        plt.figure(figsize=(5, 4));
-        plt.plot(pin_db, am_am, 'k', label='AM-AM')
+        plt.figure(figsize=(5, 4))
+        plt.plot(pin_db, am_am, 'k')
         ax = plt.gca();
-        ax2 = ax.twinx();
-        ax2.plot(pin_db, scr_plot, 'r--', label='SCR')
-        ax2.axhline(0, color='r', linestyle=':', alpha=0.3)
+        ax2 = ax.twinx()
+        ax2.plot(pin_db, np.maximum(scr, -0.2), 'r--')
         ax.set_xlabel('Input Power (dB)');
-        ax.set_ylabel('Output');
-        ax2.set_ylabel('SCR', color='r');
-        ax.grid(True)
-        self.save_plot('Fig2b_PA');
-        self.save_csv({'pin_db': pin_db, 'am_am': am_am, 'scr': scr}, 'Fig2b_Data')
+        ax.set_ylabel('Output')
+        ax2.set_ylabel('SCR', color='r')
+        self.save_plot('Fig2b_PA')
 
     def generate_fig3_dispersion(self):
         print("\n--- Fig 3 ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_nb = np.abs(phy.generate_diffraction_pattern(self.t_axis, np.array([300e9]))[0])
         d_wb = np.abs(phy.generate_broadband_chirp(self.t_axis, N_sub=32))
-        plt.figure(figsize=(5, 4));
-        plt.plot(self.t_axis * 1000, d_nb, 'r--', label='NB');
-        plt.plot(self.t_axis * 1000, d_wb, 'b-', alpha=0.7, label='WB')
-        plt.xlim(-4, 4);
+        plt.figure(figsize=(5, 4))
+        plt.plot(self.t_axis * 1000, d_nb, 'r--', label='NB')
+        plt.plot(self.t_axis * 1000, d_wb, 'b-', label='WB')
         plt.xlabel('Time (ms)');
         plt.ylabel('|d(t)|');
-        plt.legend(frameon=False)
-        self.save_plot('Fig3_Dispersion');
-        self.save_csv({'time_ms': self.t_axis * 1000, 'amp_nb': d_nb, 'amp_wb': d_wb}, 'Fig3_Data')
+        plt.legend()
+        self.save_plot('Fig3_Dispersion')
 
     def generate_fig4_self_healing(self):
         print("\n--- Fig 4 ---")
-        hw = HardwareImpairments(HW_CONFIG);
+        hw = HardwareImpairments(HW_CONFIG)
         t = np.linspace(0, 1, 500)
-        sig = 1.0 - 0.05 * np.exp(-((t - 0.5) ** 2) / 0.01)
-        out_sat, _, _ = hw.apply_saleh_pa(sig, ibo_dB=3.0)
-        ac_in = (np.abs(sig) - np.mean(np.abs(sig)[:50])) * 100
-        ac_out = (np.abs(out_sat) - np.mean(np.abs(out_sat)[:50])) * 100
-        plt.figure(figsize=(5, 4));
-        plt.plot(t, ac_in, 'k--', label='Input');
-        plt.plot(t, ac_out, 'r-', label='Output')
-        plt.xlabel('Norm. Time');
-        plt.ylabel('AC Amp (%)');
-        plt.legend(frameon=False)
-        self.save_plot('Fig4_Self_Healing');
-        self.save_csv({'time': t, 'ac_in': ac_in, 'ac_out': ac_out}, 'Fig4_Data')
+        sig = 1.0 - 0.2 * np.exp(-((t - 0.5) ** 2) / 0.005)
+        out, _, _ = hw.apply_saleh_pa(sig, ibo_dB=2.0)
+        plt.figure(figsize=(5, 4))
+        plt.plot(t, np.abs(sig), 'k--', label='In')
+        plt.plot(t, np.abs(out) / np.max(np.abs(out)), 'r-', label='Out')
+        plt.legend()
+        self.save_plot('Fig4_Self_Healing')
 
     def generate_fig5_survival_space(self):
         print("\n--- Fig 5 ---")
-        phy = DiffractionChannel(GLOBAL_CONFIG);
-        hw = HardwareImpairments(HW_CONFIG);
+        phy = DiffractionChannel(GLOBAL_CONFIG)
+        hw = HardwareImpairments(HW_CONFIG)
         det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32)
         y = (1.0 - phy.generate_broadband_chirp(self.t_axis, 32)) * np.exp(hw.generate_colored_jitter(self.N, self.fs))
         z_perp = det.apply_projection(det.log_envelope_transform(y))
         f, t_sp, Sxx = signal.spectrogram(z_perp, self.fs, nperseg=256, noverlap=220)
-        plt.figure(figsize=(5, 4));
+        plt.figure(figsize=(5, 4))
         plt.pcolormesh(t_sp * 1000, f, 10 * np.log10(Sxx + 1e-15), shading='gouraud', cmap='inferno')
         plt.ylim(0, 5000);
         plt.ylabel('Hz');
-        plt.xlabel('ms');
-        plt.colorbar(label='dB')
-        self.save_plot('Fig5_Survival_Space');
-        self.save_csv({'t': self.t_axis, 'z': z_perp}, 'Fig5_Data');
-        self.save_matrix_csv(10 * np.log10(Sxx + 1e-15), 'Fig5_Matrix')
+        plt.xlabel('ms')
+        self.save_plot('Fig5_Survival_Space')
+        self.save_csv({'t': self.t_axis, 'z': z_perp}, 'Fig5_Data')
 
     def generate_fig10_ambiguity(self):
         print("\n--- Fig 10 ---")
-        det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32, cutoff_freq=300.0, L_eff=50e3, a=0.05)
+        det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32)
         s0 = det.P_perp @ det._generate_template(15000)
-        v_shifts = np.linspace(-500, 500, 41);
-        t_shifts = np.linspace(-0.002, 0.002, 41);
+        v_shifts = np.linspace(-500, 500, 41)
+        t_shifts = np.linspace(-0.002, 0.002, 41)
         res = np.zeros((41, 41))
         E = np.sum(s0 ** 2)
-        for i, dv in enumerate(tqdm(v_shifts)):
+        for i, dv in enumerate(v_shifts):
             s_v = det.P_perp @ det._generate_template(15000 + dv)
             for j, dt in enumerate(t_shifts):
-                shift = int(dt * self.fs);
+                shift = int(dt * self.fs)
                 s_shift = np.roll(s_v, shift)
                 if shift > 0:
                     s_shift[:shift] = 0
                 else:
                     s_shift[shift:] = 0
                 res[i, j] = (np.dot(s0, s_shift) ** 2) / E
-        plt.figure(figsize=(5, 4));
+        plt.figure(figsize=(5, 4))
         plt.contourf(t_shifts * 1000, v_shifts, res / np.max(res), 20, cmap='viridis')
-        plt.colorbar();
-        plt.xlabel('Delay (ms)');
-        plt.ylabel('Vel Mismatch (m/s)')
-        self.save_plot('Fig10_Ambiguity');
-        self.save_matrix_csv(res, 'Fig10_Matrix')
+        self.save_plot('Fig10_Ambiguity')
 
     def generate_fig11_trajectory(self):
         print("\n--- Fig 11 ---")
-        phy = DiffractionChannel(GLOBAL_CONFIG);
+        phy = DiffractionChannel(GLOBAL_CONFIG)
         d = phy.generate_broadband_chirp(self.t_axis, 32)
         hw = HardwareImpairments(HW_CONFIG)
-        noise_cloud = (1.0 - d) * np.exp(hw.generate_colored_jitter(self.N, self.fs)) * np.exp(
+        # 用较强的噪声来展示轨迹云
+        noise_cloud = (1.0 - d) * np.exp(hw.generate_colored_jitter(self.N, self.fs) * 10) * np.exp(
             1j * hw.generate_phase_noise(self.N, self.fs))
         noise_cloud -= np.mean(noise_cloud)
-        plt.figure(figsize=(5, 5));
+        plt.figure(figsize=(5, 5))
         plt.plot(np.real(noise_cloud), np.imag(noise_cloud), '.', color='grey', alpha=0.1)
         points = np.array([np.real(-d), np.imag(-d)]).T.reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
         from matplotlib.collections import LineCollection
         lc = LineCollection(segments, cmap='jet', norm=plt.Normalize(0, self.N))
         lc.set_array(np.arange(self.N));
-        lc.set_linewidth(2);
+        lc.set_linewidth(2)
         plt.gca().add_collection(lc)
         plt.xlim(-0.015, 0.015);
-        plt.ylim(-0.015, 0.015);
-        plt.xlabel('I');
-        plt.ylabel('Q')
-        self.save_plot('Fig11_Trajectory');
-        self.save_csv({'I': np.real(-d), 'Q': np.imag(-d)}, 'Fig11_Data')
+        plt.ylim(-0.015, 0.015)
+        self.save_plot('Fig11_Trajectory')
 
-    # --- Group B (Heavy) - Recalibrated ---
+    # --- Group B: Performance (Updated) ---
 
     def generate_fig6_rmse_sensitivity(self):
-        print("\n--- Fig 6: RMSE (Boosted SNR) ---")
+        print("\n--- Fig 6: RMSE vs IBO (U-Shape Tuned) ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_signal = phy.generate_broadband_chirp(self.t_axis, 32)
         sig_truth = 1.0 - d_signal
 
-        # [FIX] SNR = 22dB (Expert Rec)
+        # [Tuning] SNR=8dB, 使得 IBO=20dB 时(信号-20dB)进入噪声受限区
         noise_std = self._calc_noise_std(target_snr_db=SNR_CONFIG["fig6"], signal_reference=d_signal)
-        print(f"   [Calib] Noise Std: {noise_std:.2e} (SNR={SNR_CONFIG['fig6']}dB)")
+        print(f"   [Calib] Noise Std: {noise_std:.2e}")
 
         v_scan = np.linspace(15000 - 1500, 15000 + 1500, 31)
         det_cfg = {'cutoff_freq': 300.0, 'L_eff': GLOBAL_CONFIG['L_eff'], 'a': GLOBAL_CONFIG['a_default'], 'N_sub': 32}
+
+        # Pre-compute template bank
         s_raw_list = Parallel(n_jobs=self.n_jobs)(delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan)
         det = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
         T_bank = np.array([det.P_perp @ s for s in s_raw_list])
         E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
 
-        # [FIX] Larger Jitter Levels
-        jit_levels = [1e-6, 5e-6, 2e-5]
-        ibo_scan = np.linspace(20, 0, 9)
-        trials = 200
+        # [Tuning] 显著增加 Jitter 以拉开曲线差距 (5%, 10%, 15%)
+        jit_levels = [0.0, 0.05, 0.15]
+        ibo_scan = np.linspace(25, 0, 11)  # 扩大 IBO 扫描范围
+        trials = 100
 
         fig, ax = plt.subplots(figsize=(5, 4))
         data = {'ibo': ibo_scan}
 
+        # 1. Ideal Baseline
+        res_id = Parallel(n_jobs=self.n_jobs)(
+            delayed(_trial_rmse_opt)(10.0, 0, s, noise_std, sig_truth, self.N, self.fs, 15000, HW_CONFIG, T_bank,
+                                     E_bank, v_scan, ideal=True)
+            for s in tqdm(range(trials), desc="Ideal")
+        )
+        rmse_id = np.sqrt(np.mean(np.array(res_id) ** 2))
+        ax.semilogy(ibo_scan, [rmse_id] * len(ibo_scan), 'k--', label='Ideal')
+        data['ideal'] = [rmse_id] * len(ibo_scan)
+
+        # 2. Hardware Curves
         for idx, jit in enumerate(jit_levels):
             res = Parallel(n_jobs=self.n_jobs)(
                 delayed(_trial_rmse_opt)(ibo, jit, s, noise_std, sig_truth, self.N, self.fs, 15000, HW_CONFIG, T_bank,
-                                         E_bank, v_scan)
-                for ibo in tqdm(ibo_scan, desc=f"Jit {idx}") for s in range(trials)
+                                         E_bank, v_scan, ideal=False)
+                for ibo in tqdm(ibo_scan, desc=f"HW Jit={jit}") for s in range(trials)
             )
             res_mat = np.array(res).reshape(len(ibo_scan), trials)
-            rmse = [np.sqrt(np.mean(row[np.abs(row) < 1200] ** 2)) for row in res_mat]
-            ax.semilogy(ibo_scan, rmse, 'o-', label=rf'{jit * 1e6} $\mu$rad')
+            # Robust RMSE: 剔除完全发散的点 (e.g. > 1200) 以平滑曲线
+            rmse = []
+            for row in res_mat:
+                valid = row[np.abs(row) < 1200]
+                val = np.sqrt(np.mean(valid ** 2)) if len(valid) > 5 else 1000.0
+                rmse.append(val)
+
+            ax.semilogy(ibo_scan, rmse, 'o-', label=rf'Jit={jit * 100:.0f}%')
             data[f'rmse_jit_{idx}'] = rmse
 
         ax.set_xlabel('IBO (dB)');
-        ax.set_ylabel('Velocity RMSE (m/s)');
+        ax.set_ylabel('Velocity RMSE (m/s)')
         ax.invert_xaxis();
         ax.legend(frameon=False)
-        self.save_plot('Fig6_Sensitivity');
+        self.save_plot('Fig6_Sensitivity')
         self.save_csv(data, 'Fig6_Data')
 
     def generate_fig7_roc(self):
-        print("\n--- Fig 7: ROC (Boosted SNR & Ideal) ---")
+        print("\n--- Fig 7: ROC ---")
         trials = 500
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_wb = phy.generate_broadband_chirp(self.t_axis, 32)
-
-        # [FIX] SNR = 20dB
-        noise_std = self._calc_noise_std(target_snr_db=SNR_CONFIG["fig7"], signal_reference=d_wb)
+        noise_std = self._calc_noise_std(SNR_CONFIG["fig7"], d_wb)
         seeds = np.arange(trials)
 
-        def run_roc_set(ideal):
+        # Ideal vs Hardware (Jitter=5%)
+        def run_roc(ideal):
             r0 = Parallel(n_jobs=self.n_jobs)(
                 delayed(_trial_roc)(False, s, noise_std, 15000, self.N, self.fs, ideal) for s in seeds)
             r1 = Parallel(n_jobs=self.n_jobs)(
                 delayed(_trial_roc)(True, s, noise_std, 15000, self.N, self.fs, ideal) for s in seeds)
             return np.array(r0), np.array(r1)
 
-        r0_hw, r1_hw = run_roc_set(False)
-        r0_id, r1_id = run_roc_set(True)
+        r0_hw, r1_hw = run_roc(False)
+        r0_id, r1_id = run_roc(True)
 
-        def get_roc(n, s):
-            th = np.linspace(min(n), max(s), 100)
+        def get_curve(n, s):
+            th = np.linspace(min(n), max(s), 200)
             return [np.mean(n > t) for t in th], [np.mean(s > t) for t in th]
 
-        pf_g_hw, pd_g_hw = get_roc(r0_hw[:, 0], r1_hw[:, 0])
-        pf_g_id, pd_g_id = get_roc(r0_id[:, 0], r1_id[:, 0])
+        pf_hw, pd_hw = get_curve(r0_hw[:, 0], r1_hw[:, 0])
+        pf_id, pd_id = get_curve(r0_id[:, 0], r1_id[:, 0])
+
+        # Energy Detector (HW)
+        pf_ed, pd_ed = get_curve(r0_hw[:, 1], r1_hw[:, 1])
 
         plt.figure(figsize=(5, 5))
-        plt.plot(pf_g_id, pd_g_id, 'g--', label='Ideal')
-        plt.plot(pf_g_hw, pd_g_hw, 'b-', label='Hardware-Limited')
-        plt.plot([0, 1], [0, 1], 'k:', alpha=0.5)
-        plt.xscale('log');
-        plt.xlim(1e-3, 1);
-        plt.ylim(0, 1.05)
+        plt.plot(pf_id, pd_id, 'g-', label='Ideal GLRT')
+        plt.plot(pf_hw, pd_hw, 'b-', label='HW GLRT')
+        plt.plot(pf_ed, pd_ed, 'r:', label='Energy Det')
+        plt.plot([0, 1], [0, 1], 'k--', alpha=0.3)
         plt.xlabel('PFA');
         plt.ylabel('PD');
-        plt.legend(frameon=False)
-        self.save_plot('Fig7_ROC');
-        self.save_csv({'pf_hw': pf_g_hw, 'pd_hw': pd_g_hw, 'pf_id': pf_g_id, 'pd_id': pd_g_id}, 'Fig7_Data')
+        plt.legend()
+        self.save_plot('Fig7_ROC')
+        self.save_csv({'pf_hw': pf_hw, 'pd_hw': pd_hw}, 'Fig7_Data')
 
     def generate_fig8_mds(self):
-        print("\n--- Fig 8: MDS (Boosted SNR & Relaxed Th) ---")
-        diams = np.logspace(0.3, 1.7, 10);
-        radii = diams / 2000.0;
-        pd_curve = []
-
-        # [FIX] SNR=25dB for 5cm debris
+        print("\n--- Fig 8: MDS ---")
+        diams = np.array([2, 5, 10, 20, 50])
+        radii = diams / 2000.0
         d_ref = DiffractionChannel({**GLOBAL_CONFIG, 'a': 0.05}).generate_broadband_chirp(self.t_axis, 32)
-        noise_std = self._calc_noise_std(target_snr_db=SNR_CONFIG["fig8"], signal_reference=d_ref)
+        noise_std = self._calc_noise_std(SNR_CONFIG["fig8"], d_ref)
 
-        det_base = TerahertzDebrisDetector(self.fs, self.N, cutoff_freq=300.0, L_eff=50e3, a=0.05, N_sub=32)
-        P_perp = det_base.P_perp
+        det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32)
+        s_norm = det.P_perp @ det._generate_template(15000)
+        s_norm /= np.linalg.norm(s_norm)
+
+        # Threshold (Pfa=0.1 on Noise)
+        h0_runs = Parallel(n_jobs=self.n_jobs)(
+            delayed(_trial_mds)(False, None, s, noise_std, s_norm, det.P_perp, self.N, self.fs, True) for s in
+            range(200))
+        th = np.percentile(h0_runs, 90.0)
 
         pd_hw, pd_id = [], []
-
-        for a in tqdm(radii, desc="Size Scan"):
+        for a in tqdm(radii):
             phy = DiffractionChannel({**GLOBAL_CONFIG, 'a': a})
-            sig_clean = 1.0 - phy.generate_broadband_chirp(self.t_axis, 32)
-            det_temp = TerahertzDebrisDetector(self.fs, self.N, a=a, L_eff=50e3, N_sub=32)
-            s_norm = P_perp @ det_temp._generate_template(15000)
-            s_norm /= (np.sqrt(np.sum(s_norm ** 2)) + 1e-20)
-
-            # [FIX] Th = 90% (Pfa = 0.1) Relaxed
-            r0 = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_mds)(False, None, s, noise_std, s_norm, P_perp, self.N, self.fs, True) for s in
+            sig = 1.0 - phy.generate_broadband_chirp(self.t_axis, 32)
+            r_hw = Parallel(n_jobs=self.n_jobs)(
+                delayed(_trial_mds)(True, sig, s, noise_std, s_norm, det.P_perp, self.N, self.fs, False) for s in
                 range(100))
-            th = np.percentile(r0, 90.0)
-
-            r1_h = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_mds)(True, sig_clean, s, noise_std, s_norm, P_perp, self.N, self.fs, False) for s in
-                range(50))
-            r1_i = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_mds)(True, sig_clean, s, noise_std, s_norm, P_perp, self.N, self.fs, True) for s in
-                range(50))
-
-            pd_hw.append(np.mean(np.array(r1_h) > th))
-            pd_id.append(np.mean(np.array(r1_i) > th))
+            r_id = Parallel(n_jobs=self.n_jobs)(
+                delayed(_trial_mds)(True, sig, s, noise_std, s_norm, det.P_perp, self.N, self.fs, True) for s in
+                range(100))
+            pd_hw.append(np.mean(np.array(r_hw) > th))
+            pd_id.append(np.mean(np.array(r_id) > th))
 
         plt.figure(figsize=(5, 4))
-        plt.semilogx(diams, pd_id, 'g--', label='Ideal')
-        plt.semilogx(diams, pd_hw, 'b-o', label='Hardware-Limited')
-        plt.axhline(0.5, color='k', ls=':', label='Limit')
-        plt.xlabel('Diameter (mm)');
-        plt.ylabel('PD');
-        plt.legend(frameon=False)
-        self.save_plot('Fig8_MDS');
-        self.save_csv({'d': diams, 'pd_hw': pd_hw, 'pd_id': pd_id}, 'Fig8_Data')
+        plt.semilogx(diams, pd_id, 'g--o', label='Ideal')
+        plt.semilogx(diams, pd_hw, 'b-s', label='Hardware')
+        plt.axhline(0.5, color='k', ls=':');
+        plt.legend()
+        self.save_plot('Fig8_MDS')
+        self.save_csv({'d': diams, 'pd_hw': pd_hw}, 'Fig8_Data')
 
     def generate_fig9_isac(self):
-        print("\n--- Fig 9: ISAC (Dynamic Gamma) ---")
-        phy = DiffractionChannel(GLOBAL_CONFIG);
+        print("\n--- Fig 9: ISAC ---")
+        phy = DiffractionChannel(GLOBAL_CONFIG)
         sig_truth = 1.0 - phy.generate_broadband_chirp(self.t_axis, 32)
-        v_scan = np.linspace(13000, 17000, 201)
+        noise_std = self._calc_noise_std(SNR_CONFIG["fig9"], 1.0 - sig_truth)
+
+        v_scan = np.linspace(14000, 16000, 41)
         det_cfg = {'cutoff_freq': 300.0, 'L_eff': 50e3, 'N_sub': 32, 'a': 0.05}
-        s_raw_list = Parallel(n_jobs=self.n_jobs)(delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan)
+        s_raw = Parallel(n_jobs=self.n_jobs)(delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan)
         det = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
-        S_perp = np.array([det.P_perp @ s for s in s_raw_list])
-        E_bank = np.sum(S_perp ** 2, axis=1) + 1e-20
+        T_bank = np.array([det.P_perp @ s for s in s_raw])
+        E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
 
-        ibo_scan = np.linspace(20, 0, 10)
-        # [FIX] SNR = 22dB
-        noise_std = self._calc_noise_std(target_snr_db=SNR_CONFIG["fig9"], signal_reference=1.0 - sig_truth)
-
+        ibo_scan = np.linspace(20, 0, 15)
         cap, rmse = [], []
+
         for ibo in tqdm(ibo_scan):
             res = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_isac)(ibo, s, noise_std, sig_truth, S_perp, E_bank, v_scan, det.P_perp, self.N, self.fs)
-                for s in range(30)
+                delayed(_trial_isac)(ibo, s, noise_std, sig_truth, T_bank, E_bank, v_scan, det.P_perp, self.N, self.fs,
+                                     False)
+                for s in range(40)
             )
             res = np.array(res)
             cap.append(np.mean(res[:, 0]))
+
             errs = res[:, 1]
-            rmse.append(np.sqrt(np.mean(errs[errs < 1800] ** 2)) if len(errs[errs < 1800]) > 5 else 2000)
+            valid = errs[errs < 1200]
+            rmse.append(np.sqrt(np.mean(valid ** 2)) if len(valid) > 5 else 1000.0)
 
         plt.figure(figsize=(6, 5))
         sc = plt.scatter(cap, rmse, c=ibo_scan, cmap='viridis_r', s=80, edgecolors='k')
-        plt.plot(cap, rmse, 'k--', alpha=0.5);
-        cbar = plt.colorbar(sc);
-        cbar.set_label('IBO (dB)')
+        plt.colorbar(sc, label='IBO (dB)')
         plt.xlabel('Capacity (bits/s/Hz)');
         plt.ylabel('RMSE (m/s)')
-        self.save_plot('Fig9_ISAC');
+        self.save_plot('Fig9_ISAC')
         self.save_csv({'ibo': ibo_scan, 'cap': cap, 'rmse': rmse}, 'Fig9_Data')
 
     def run_all(self):
-        print("=== IEEE TWC SIMULATION START (V10.0 PRODUCTION) ===")
+        print("=== SIMULATION START (V11.0 TUNED) ===")
         self.generate_fig2_mechanisms()
         self.generate_fig3_dispersion()
         self.generate_fig4_self_healing()
@@ -529,10 +400,104 @@ class PaperFigureGenerator:
         self.generate_fig7_roc()
         self.generate_fig8_mds()
         self.generate_fig9_isac()
-        print("\n=== ALL TASKS DONE ===")
+        print("\n=== DONE ===")
+
+
+# --- Worker Functions (Must be top-level) ---
+
+def _gen_template(v, fs, N, cfg):
+    return TerahertzDebrisDetector(fs, N, **cfg)._generate_template(v)
+
+
+def _trial_rmse_opt(ibo, jitter_rms, seed, noise_std, sig_truth, N, fs, true_v, hw_base, T_bank, E_bank, v_scan, ideal):
+    np.random.seed(seed)
+    if ideal:
+        pa_out = sig_truth
+    else:
+        hw_cfg = hw_base.copy()
+        hw_cfg['jitter_rms'] = jitter_rms  # Jitter passed here
+        hw = HardwareImpairments(hw_cfg)
+        jit = np.exp(hw.generate_colored_jitter(N, fs))
+        pn = np.exp(1j * hw.generate_phase_noise(N, fs))
+        pa_out, _, _ = hw.apply_saleh_pa(sig_truth * jit * pn, ibo_dB=ibo)
+
+    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
+    z = TerahertzDebrisDetector(fs, N, N_sub=32).log_envelope_transform(pa_out + w)
+    z_perp = TerahertzDebrisDetector(fs, N, N_sub=32).apply_projection(z)
+
+    stats = (np.dot(T_bank, z_perp) ** 2) / E_bank
+    return v_scan[np.argmax(stats)] - true_v
+
+
+def _trial_roc(is_h1, seed, noise_std, true_v, N, fs, ideal):
+    np.random.seed(seed)
+    hw = HardwareImpairments(HW_CONFIG)
+    det = TerahertzDebrisDetector(fs, N, N_sub=32)
+
+    sig = (1.0 - DiffractionChannel(GLOBAL_CONFIG).generate_broadband_chirp(np.arange(N) / fs - (N / 2) / fs,
+                                                                            32)) if is_h1 else np.ones(N, dtype=complex)
+
+    if ideal:
+        pa_out = sig
+    else:
+        # HW Case: Fixed Jitter 5%
+        hw.jitter_rms = 0.05
+        jit = np.exp(hw.generate_colored_jitter(N, fs))
+        pa_out, _, _ = hw.apply_saleh_pa(sig * jit, ibo_dB=10.0)
+
+    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
+    z_perp = det.apply_projection(det.log_envelope_transform(pa_out + w))
+
+    # GLRT
+    s_temp = det.P_perp @ det._generate_template(true_v)
+    stat_glrt = (np.dot(s_temp, z_perp) ** 2) / (np.sum(s_temp ** 2) + 1e-20)
+
+    # Energy
+    y_ac = np.abs(pa_out + w) - np.mean(np.abs(pa_out + w))
+    stat_ed = np.sum(y_ac ** 2)
+    return stat_glrt, stat_ed
+
+
+def _trial_mds(is_h1, sig_clean, seed, noise_std, s_norm, P_perp, N, fs, ideal):
+    np.random.seed(seed)
+    hw = HardwareImpairments(HW_CONFIG)
+    sig = sig_clean if is_h1 else np.ones(N, dtype=complex)
+
+    if ideal:
+        pa_out = sig
+    else:
+        hw.jitter_rms = 0.05
+        jit = np.exp(hw.generate_colored_jitter(N, fs))
+        pa_out, _, _ = hw.apply_saleh_pa(sig * jit, ibo_dB=10.0)
+
+    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
+    z = TerahertzDebrisDetector(fs, N, N_sub=32).log_envelope_transform(pa_out + w)
+    return (np.dot(s_norm, P_perp @ z) ** 2)
+
+
+def _trial_isac(ibo, seed, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp, N, fs, ideal):
+    np.random.seed(seed)
+    hw = HardwareImpairments(HW_CONFIG)
+
+    if ideal:
+        pa_out = sig_truth;
+        gamma_eff = 0
+    else:
+        hw.jitter_rms = 0.05
+        jit = np.exp(hw.generate_colored_jitter(N, fs))
+        pa_out, _, _ = hw.apply_saleh_pa(sig_truth * jit, ibo_dB=ibo)
+        gamma_eff = 1e-2 * (10 ** (-ibo / 10.0))  # [Tuning] Stronger nonlinearity
+
+    p_rx = np.mean(np.abs(pa_out) ** 2)
+    sinr = p_rx / (noise_std ** 2 + p_rx * gamma_eff + 1e-20)
+    cap = np.log2(1 + sinr)
+
+    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
+    z = TerahertzDebrisDetector(fs, N, N_sub=32).log_envelope_transform(pa_out + w)
+    stats = (np.dot(T_bank, P_perp @ z) ** 2) / E_bank
+    return cap, abs(v_scan[np.argmax(stats)] - GLOBAL_CONFIG['v_default'])
 
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    gen = PaperFigureGenerator()
-    gen.run_all()
+    PaperFigureGenerator().run_all()

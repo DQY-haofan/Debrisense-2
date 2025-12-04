@@ -1,12 +1,11 @@
 # ----------------------------------------------------------------------------------
 # 脚本名称: reproduce_paper_results_ieee.py
-# 版本: v18.0 (Final Production - Verified Physics)
+# 版本: v19.0 (Ultimate Stress Test)
 # 描述:
-#   1. [Verified] 基于 debug_sensitivity 验证通过的参数进行最终微调。
-#      - 探测器极强 (Pass@-10dB)，因此无需过高的 SNR 补偿。
-#      - 将 SNR 设定在 12-15dB 区间，以展示性能恶化的“坡度”。
-#   2. [Robustness] 增强文件保存功能，确保 .pdf, .png, .csv 必出，并打印路径。
-#   3. [Jitter] 使用 [1e-5, 5e-5, 1e-4] 以在强鲁棒性下展示不同硬件的差距。
+#   1. [Physics Update] 基于 debug 发现的超强检测能力 (PG~36dB)，大幅增加测试难度：
+#      - SNR 降至 0.0 dB (Fig 6) 和 -5.0 dB (Fig 8)。
+#      - Jitter 提升至 [1e-4, 5e-4, 2e-3] 以寻找鲁棒性边界。
+#   2. [System] 增加文件保存的绝对路径打印，确保 CSV/PDF 可追踪。
 # ----------------------------------------------------------------------------------
 
 import numpy as np
@@ -46,14 +45,13 @@ GLOBAL_CONFIG = {
     'a_default': 0.05, 'v_default': 15000
 }
 
-# [CRITICAL] 最终参数 (基于 Debug 结果调整)
-# Debug 显示 -10dB 都能 Pass，所以我们不需要 55dB 那么高。
-# 设在 12-15dB 可以展示出噪声带来的轻微扰动，避免曲线完全死平。
+# [CRITICAL] 最终参数调优 (Stress Test)
+# 只有在这些极端参数下，性能极强的 GLRT 才会显示出"失败"，从而形成曲线。
 SNR_CONFIG = {
-    "fig6": 12.0,
-    "fig7": 12.0,
-    "fig8": 5.0,  # 降低 MDS 的 SNR，让小目标检测变得困难，形成 S 曲线
-    "fig9": 12.0
+    "fig6": 0.0,  # [Aggressive] 0dB SNR. 在 IBO=30dB 时 Eff SNR=-30dB -> 临界点
+    "fig7": 0.0,  # ROC 也需要在低 SNR 下看区别
+    "fig8": -5.0,  # [Aggressive] -5dB. 让小目标 (2mm) 彻底埋没在噪声里
+    "fig9": 0.0
 }
 
 HW_CONFIG = {
@@ -68,22 +66,24 @@ class PaperFigureGenerator:
     def __init__(self, output_dir='results'):
         self.out_dir = output_dir
         self.csv_dir = os.path.join(output_dir, 'csv_data')
+        # Ensure directories exist
         if not os.path.exists(self.out_dir): os.makedirs(self.out_dir)
         if not os.path.exists(self.csv_dir): os.makedirs(self.csv_dir)
+
         self.fs = GLOBAL_CONFIG['fs']
         self.N = int(self.fs * GLOBAL_CONFIG['T_span'])
         self.t_axis = np.arange(self.N) / self.fs - (self.N / 2) / self.fs
         self.n_jobs = max(1, multiprocessing.cpu_count() - 2)
         print(f"[Init] Cores: {self.n_jobs} | SNR Config: {SNR_CONFIG}")
-        print(f"[Init] Output Dir: {os.path.abspath(self.out_dir)}")
+        print(f"[Init] Output Directory: {os.path.abspath(self.out_dir)}")
 
     def save_plot(self, name):
         plt.tight_layout(pad=0.5)
-        path_png = f"{self.out_dir}/{name}.png"
-        path_pdf = f"{self.out_dir}/{name}.pdf"
+        path_png = os.path.abspath(f"{self.out_dir}/{name}.png")
+        path_pdf = os.path.abspath(f"{self.out_dir}/{name}.pdf")
         plt.savefig(path_png, dpi=300, bbox_inches='tight')
         plt.savefig(path_pdf, format='pdf', bbox_inches='tight')
-        print(f"   [Saved] Plot: {name} (.png/.pdf)")
+        print(f"   [Saved Plot] {name} -> {path_pdf}")
         plt.close('all')
 
     def save_csv(self, data, name):
@@ -96,9 +96,9 @@ class PaperFigureGenerator:
                 aligned[k] = padded
             else:
                 aligned[k] = np.full(max_len, v)
-        path = f"{self.csv_dir}/{name}.csv"
+        path = os.path.abspath(f"{self.csv_dir}/{name}.csv")
         pd.DataFrame(aligned).to_csv(path, index=False)
-        print(f"   [Saved] Data: {path}")
+        print(f"   [Saved Data] {name} -> {path}")
 
     def _calc_noise_std(self, target_snr_db, signal_reference):
         p_sig = np.mean(np.abs(signal_reference) ** 2)
@@ -204,7 +204,7 @@ class PaperFigureGenerator:
         plt.plot(np.real(noise_cloud), np.imag(noise_cloud), '.', color='grey', alpha=0.1)
         self.save_plot('Fig11_Trajectory')
 
-    # --- Group B: Performance (Verified Levels) ---
+    # --- Group B: Performance (Stress Test) ---
 
     def generate_fig6_rmse_sensitivity(self):
         print("\n--- Fig 6: RMSE vs IBO ---")
@@ -222,8 +222,8 @@ class PaperFigureGenerator:
         T_bank = np.array([P_perp @ s for s in s_raw_list])
         E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
 
-        # [Verified Jitter] 1e-5 to 1e-4 range to show degradation
-        jit_levels = [1.0e-5, 5.0e-5, 1.0e-4]
+        # [Tuning] 使用更大的 Jitter 范围，试图打破鲁棒性
+        jit_levels = [1.0e-4, 5.0e-4, 2.0e-3]
         ibo_scan = np.linspace(30, 0, 13)
         trials = 100
 
@@ -280,7 +280,7 @@ class PaperFigureGenerator:
         sig_h1_clean = 1.0 - d_wb
         sig_h0_clean = np.ones(self.N, dtype=complex)
 
-        roc_jitter = 5.0e-5  # Stronger jitter to show ROC drop
+        roc_jitter = 5.0e-4
 
         def run_roc(ideal):
             r0 = Parallel(n_jobs=self.n_jobs)(
@@ -331,7 +331,7 @@ class PaperFigureGenerator:
         th = np.percentile(h0_runs, 90.0)
 
         pd_hw, pd_id = [], []
-        mds_jitter = 2.0e-5
+        mds_jitter = 1.0e-4
 
         for a in tqdm(radii):
             phy = DiffractionChannel({**GLOBAL_CONFIG, 'a': a})
@@ -371,7 +371,7 @@ class PaperFigureGenerator:
 
         ibo_scan = np.linspace(20, 0, 15)
         cap, rmse = [], []
-        isac_jitter = 2.0e-5
+        isac_jitter = 1.0e-4
 
         for ibo in tqdm(ibo_scan):
             res = Parallel(n_jobs=self.n_jobs)(
@@ -395,7 +395,7 @@ class PaperFigureGenerator:
         self.save_csv({'ibo': ibo_scan, 'cap': cap, 'rmse': rmse}, 'Fig9_Data')
 
     def run_all(self):
-        print("=== SIMULATION START (V18.0 FINAL VERIFIED) ===")
+        print("=== SIMULATION START (V19.0 ULTIMATE STRESS TEST) ===")
         self.generate_fig2_mechanisms()
         self.generate_fig3_dispersion()
         self.generate_fig4_self_healing()

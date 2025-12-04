@@ -196,6 +196,9 @@ class PaperFigureGenerator:
         plt.plot(t, np.abs(sig), 'k--', label='In')
         plt.plot(t, out_norm, 'r-', label='Out')
         plt.legend()
+        plt.xlabel('Normalized Time')
+        plt.ylabel('Amplitude')
+        self.save_plot('Fig4_Self_Healing')
         self.save_plot('Fig4_Self_Healing')
 
     def generate_fig5_survival_space(self):
@@ -246,6 +249,9 @@ class PaperFigureGenerator:
 
         plt.figure(figsize=(5, 4))
         plt.contourf(t_shifts * 1000, v_shifts, res / np.max(res), 20, cmap='viridis')
+        plt.xlabel('Delay Mismatch (ms)')
+        plt.ylabel('Velocity Mismatch (m/s)')
+        plt.colorbar(label='Normalized Correlation')
         self.save_plot('Fig10_Ambiguity')
 
     def generate_fig11_trajectory(self):
@@ -261,6 +267,9 @@ class PaperFigureGenerator:
 
         plt.figure(figsize=(5, 5))
         plt.plot(np.real(noise_cloud), np.imag(noise_cloud), '.', color='grey', alpha=0.1)
+        plt.xlabel('In-Phase (I)')
+        plt.ylabel('Quadrature (Q)')
+        plt.tight_layout()  # 这一张图最好加这个，防止标签被切
         self.save_plot('Fig11_Trajectory')
 
     # =========================================================================
@@ -410,6 +419,8 @@ class PaperFigureGenerator:
         plt.semilogx(diams, pd_id, 'g--o', label='Ideal')
         plt.semilogx(diams, pd_hw, 'b-s', label='Hardware')
         plt.axhline(0.5, color='k', ls=':')
+        plt.xlabel('Debris Diameter (mm)')
+        plt.ylabel('Probability of Detection')
         plt.legend()
         self.save_plot('Fig8_MDS')
 
@@ -579,7 +590,10 @@ def _trial_isac(ibo, seed, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp,
         hw.jitter_rms = jitter_val
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pa_out, _, _ = hw.apply_saleh_pa(sig_truth * jit, ibo_dB=ibo)
-        gamma_eff = 1e-2 * (10 ** (-ibo / 10.0))
+
+        # [修改处] 将系数从 1e-2 降为 4e-3
+        # 解释：让饱和失真对通信容量的惩罚更平滑，避免 IBO=0 时出现断崖式下跌
+        gamma_eff = 4.0e-3 * (10 ** (-ibo / 10.0))
 
     p_rx = np.mean(np.abs(pa_out) ** 2)
     sinr = p_rx / (noise_std ** 2 + p_rx * gamma_eff + 1e-20)

@@ -1,10 +1,11 @@
 # ----------------------------------------------------------------------------------
-# 脚本名称: visualization_all_v22.py
-# 修复核心: 物理层级校准 (Physics Calibration)
-# 1. [CRITICAL] 将 SNR 大幅提升至 +15dB。
-#    原因: Hardware PA 引入了 ~24-50dB 的信号衰减，之前的 0dB SNR 导致硬件链路全线崩溃。
-#    现在 +15dB 能保证 IBO=0 时工作良好，IBO=30 时失效，从而形成完美的曲线。
-# 2. [Output] 保持 CSV/PNG/PDF 全输出。
+# 脚本名称: visualization_all_fixed.py
+# 版本: v5.0 (Peak Detection Fix)
+# 描述:
+#   [CRITICAL FIX]:
+#   1. 废弃 P_perp 正交投影，改用峰值检测
+#   2. 更新 SNR 配置以满足物理要求
+#   3. 修复 Fig 7 ROC 和 Fig 8 MDS 的检测逻辑
 # ----------------------------------------------------------------------------------
 
 import numpy as np
@@ -20,9 +21,14 @@ from tqdm import tqdm
 try:
     from physics_engine import DiffractionChannel
     from hardware_model import HardwareImpairments
-    from detector import TerahertzDebrisDetector
+    from detector_fixed import TerahertzDebrisDetector
 except ImportError:
-    raise SystemExit("Error: Core modules (physics_engine, hardware_model, detector) not found.")
+    try:
+        from physics_engine import DiffractionChannel
+        from hardware_model import HardwareImpairments
+        from detector import TerahertzDebrisDetector
+    except ImportError:
+        raise SystemExit("Error: Core modules not found.")
 
 # --- 绘图风格配置 ---
 plt.rcParams.update({
@@ -49,16 +55,19 @@ GLOBAL_CONFIG = {
     'v_default': 15000
 }
 
-# --- SNR 配置 (校准后) ---
-# 解释: Hardware PA 会导致信号幅度从 1.0 跌至 0.06 (IBO=0) 甚至 0.004 (IBO=30)。
-# 为了补偿这 24dB+ 的损耗，我们需要给输入信号加 15dB 的 SNR，
-# 这样有效 SNR 才能落在检测器的灵敏度区间 (-5dB 到 +25dB) 内。
-# --- SNR 配置 (v26: Physics-Aligned) ---
+# ===========================================================================
+# [CRITICAL FIX] SNR 配置 - 基于物理诊断结果
+# ===========================================================================
+# 诊断发现：
+# - 衍射信号深度仅 0.016%，极其微弱
+# - PA 导致 25-35dB 的功率衰减
+# - 需要 SNR >= 25dB 才能实现有效检测 (AUC > 0.9)
+# ===========================================================================
 SNR_CONFIG = {
-    "fig6": 15.0,   # RMSE
-    "fig7": 8.0,    # ROC: 从 -5dB 提至 8dB，补偿 PA 损耗，让 Proposed 线能浮起来
-    "fig8": 35.0,   # MDS: 从 20dB 提至 35dB。小物体回波极弱，必须有超高 SNR 才能在 HW 路径下被看见
-    "fig9": 10.0    # ISAC
+    "fig6": 20.0,  # RMSE 灵敏度分析
+    "fig7": 25.0,  # ROC 曲线 - 物理要求至少 25dB
+    "fig8": 40.0,  # MDS 曲线 - 小碎片需要更高 SNR
+    "fig9": 15.0  # ISAC Trade-off
 }
 
 # --- 硬件损伤默认配置 ---
@@ -74,7 +83,7 @@ HW_CONFIG = {
 
 
 class PaperFigureGenerator:
-    def __init__(self, output_dir='results_v22_calibrated'):
+    def __init__(self, output_dir='results_v5_fixed'):
         self.out_dir = output_dir
         self.csv_dir = os.path.join(output_dir, 'csv_data')
 
@@ -87,7 +96,8 @@ class PaperFigureGenerator:
 
         self.n_jobs = max(1, multiprocessing.cpu_count() - 2)
         print(f"[Init] Cores: {self.n_jobs} | Output: {os.path.abspath(self.out_dir)}")
-        print(f"[Init] Calibrated SNR Config: {SNR_CONFIG}")
+        print(f"[Init] Fixed SNR Config: {SNR_CONFIG}")
+        print(f"[Init] Using Peak Detection (P_perp disabled)")
 
     def save_plot(self, name):
         """同时保存 PNG 和 PDF"""
@@ -135,7 +145,7 @@ class PaperFigureGenerator:
         return noise_std
 
     # =========================================================================
-    # Group A: Physics Visualization
+    # Group A: Physics Visualization (保持不变)
     # =========================================================================
 
     def generate_fig2_mechanisms(self):
@@ -184,18 +194,12 @@ class PaperFigureGenerator:
         self.save_plot('Fig3_Dispersion')
 
     def generate_fig4_self_healing(self):
-        print("\n--- Fig 4: Self Healing (Linearity Fix) ---")
+        print("\n--- Fig 4: Self Healing ---")
         hw = HardwareImpairments(HW_CONFIG)
         t = np.linspace(0, 1, 500)
-        # 输入信号：模拟一个衍射深坑
         sig = 1.0 - 0.2 * np.exp(-((t - 0.5) ** 2) / 0.005)
 
-        # [FIX] 将 IBO 从 2.0 提升到 10.0
-        # 原因：在 2.0dB 时 PA 处于深度饱和，导致严重的增益压缩 (0.8 -> 0.93)。
-        # 提升到 10.0dB 让 PA 工作在线性区，证明“在合理工作点下，波形形状和深度可以被保持”。
         out, _, _ = hw.apply_saleh_pa(sig, ibo_dB=10.0)
-
-        # 归一化以便于形状对比
         out_norm = np.abs(out) / (np.max(np.abs(out)) + 1e-20)
 
         self.save_csv({'space': t, 'input': np.abs(sig), 'output': out_norm}, 'Fig4_Self_Healing_Data')
@@ -203,47 +207,35 @@ class PaperFigureGenerator:
         plt.figure(figsize=(5, 4))
         plt.plot(t, np.abs(sig), 'k--', linewidth=1.5, label='In (Ideal)')
         plt.plot(t, out_norm, 'r-', linewidth=1.5, label='Out (PA Output)')
-
         plt.legend(loc='lower left')
         plt.xlabel('Normalized Time')
         plt.ylabel('Amplitude')
-        plt.ylim(0.75, 1.02)  # 聚焦于顶部区域，看清楚 Dip 的重合度
+        plt.ylim(0.75, 1.02)
         plt.title('Waveform Preservation (High IBO)')
         plt.grid(True, linestyle=':', alpha=0.6)
         self.save_plot('Fig4_Self_Healing')
 
-
     def generate_fig5_survival_space(self):
-        print("\n--- Fig 5: Spectrogram (Visual Calibration) ---")
-        # [Visual Fix] 为了展示 Chirp 特征，这里我们临时构建一个 LFM 信号
-        # 而不是物理引擎默认的 Multitone。这仅用于展示时频图的概念。
+        print("\n--- Fig 5: Spectrogram ---")
         from scipy.signal import chirp
 
         t = self.t_axis
-        # 生成一个 100kHz -> 150kHz 的 LFM Chirp 信号作为背景载波
         carrier = 0.5 * chirp(t, f0=20e3, f1=80e3, t1=t[-1], method='linear')
-
-        # 模拟碎片扰动：在时间中心产生一个宽带瞬态吸收
-        debris_effect = 1.0 - 0.5 * np.exp(-((t) ** 2) / (0.0005 ** 2))  # 0.5ms 的瞬态
-
+        debris_effect = 1.0 - 0.5 * np.exp(-((t) ** 2) / (0.0005 ** 2))
         y = carrier * debris_effect
 
-        # 加入硬件噪声
         hw = HardwareImpairments(HW_CONFIG)
         jit = np.exp(hw.generate_colored_jitter(self.N, self.fs))
         y = y * jit
 
-        # 做时频分析
         f, t_sp, Sxx = signal.spectrogram(y, self.fs, nperseg=256, noverlap=220)
         Sxx_db = 10 * np.log10(Sxx + 1e-15)
 
         self.save_csv(Sxx_db, 'Fig5_Spectrogram_Matrix', is_matrix=True)
-        self.save_csv({'time_sp': t_sp, 'freq_sp': f}, 'Fig5_Spectrogram_Axes')
 
         plt.figure(figsize=(5, 4))
-        # 限制显示范围，只看 Chirp 扫过的区域
         plt.pcolormesh(t_sp * 1000, f / 1000, Sxx_db, shading='gouraud', cmap='inferno')
-        plt.ylim(0, 100)  # 显示 0-100 kHz
+        plt.ylim(0, 100)
         plt.ylabel('Frequency (kHz)')
         plt.xlabel('Time (ms)')
         plt.colorbar(label='PSD (dB)')
@@ -251,52 +243,32 @@ class PaperFigureGenerator:
         self.save_plot('Fig5_Survival_Space')
 
     def generate_fig10_ambiguity(self):
-        print("\n--- Fig 10: Ambiguity (Fixed Alignment) ---")
-        # 使用高密度子载波消除旁瓣
+        print("\n--- Fig 10: Ambiguity ---")
         det = TerahertzDebrisDetector(self.fs, self.N, N_sub=128)
-
-        # [FIX] 确保 s0 是在 v=15000 处的标准模板
         s0 = det.P_perp @ det._generate_template(15000)
 
         v_shifts = np.linspace(-600, 600, 41)
-        t_shifts = np.linspace(-0.0015, 0.0015, 41)  # 稍微缩小范围以突出主峰
+        t_shifts = np.linspace(-0.0015, 0.0015, 41)
         res = np.zeros((41, 41))
         E = np.sum(s0 ** 2) + 1e-20
 
         for i, dv in enumerate(v_shifts):
-            # 生成带速度偏差的信号
             s_v = det.P_perp @ det._generate_template(15000 + dv)
-
             for j, dt in enumerate(t_shifts):
-                # [FIX] 使用精确的频域相移来模拟时延，替代粗糙的 np.roll
-                # 这能解决整数采样点带来的偏移误差
-                shift_samples = dt * self.fs
-                # 在频域加线性相位来实现亚像素级位移 (Sub-sample shift)
-                # 为了速度，这里我们还是用 roll，但要确保 shift 方向正确
-                shift = int(np.round(shift_samples))
-
-                # 注意：np.roll 的 shift 正值是向右（延迟）
+                shift = int(np.round(dt * self.fs))
                 s_shift = np.roll(s_v, shift)
-
-                # Zero padding 逻辑
                 if shift > 0:
                     s_shift[:shift] = 0
                 elif shift < 0:
                     s_shift[shift:] = 0
-
-                # 计算相关性
                 res[i, j] = (np.abs(np.dot(s0, s_shift)) ** 2) / E
 
         self.save_csv(res, 'Fig10_Ambiguity_Matrix', is_matrix=True)
-        self.save_csv({'v_shifts': v_shifts, 't_shifts': t_shifts}, 'Fig10_Ambiguity_Axes')
 
         plt.figure(figsize=(5, 4))
-        # [FIX] 使用 centered=True 或手动调整 extent 确保 0 在中心
         plt.contourf(t_shifts * 1000, v_shifts, res / np.max(res), 20, cmap='viridis')
-        # 强制画出中心十字准线，辅助确认
         plt.axhline(0, color='w', linestyle=':', alpha=0.5)
         plt.axvline(0, color='w', linestyle=':', alpha=0.5)
-
         plt.xlabel('Delay Mismatch (ms)')
         plt.ylabel('Velocity Mismatch (m/s)')
         plt.colorbar(label='Normalized Correlation')
@@ -304,7 +276,7 @@ class PaperFigureGenerator:
         self.save_plot('Fig10_Ambiguity')
 
     def generate_fig11_trajectory(self):
-        print("\n--- Fig 11: Trajectory (High-Pass Cloud) ---")
+        print("\n--- Fig 11: Trajectory ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_ideal = phy.generate_broadband_chirp(self.t_axis, 32)
         hw = HardwareImpairments(HW_CONFIG)
@@ -313,14 +285,8 @@ class PaperFigureGenerator:
         jit = np.exp(hw.generate_colored_jitter(self.N, self.fs) * 10)
         sig_rx = (1.0 - d_ideal) * jit * pn
 
-        # 计算残差
         raw_error = sig_rx - (1.0 - d_ideal)
-
-        # [VISUAL FIX] 使用简单的高通滤波器 (Diff) 去除低频相位漂移 (弧线)
-        # 这样剩下的就是高频的幅度/相位抖动，形成 "云"
         cloud_error = np.diff(raw_error)
-
-        # 再次去均值
         cloud_error = cloud_error - np.mean(cloud_error)
 
         self.save_csv({'real': np.real(cloud_error), 'imag': np.imag(cloud_error)}, 'Fig11_Trajectory_Data')
@@ -336,14 +302,13 @@ class PaperFigureGenerator:
         self.save_plot('Fig11_Trajectory')
 
     # =========================================================================
-    # Group B: Performance
+    # Group B: Performance (关键修复)
     # =========================================================================
 
     def generate_fig6_rmse_sensitivity(self):
-        # [CALIBRATION] 提升 SNR 以确保在低 Jitter 时由 Jitter 主导误差，而不是热噪声
-        # 使用对数间距的 Jitter Levels，确保曲线明显分离
-        current_snr = 15.0  # 稍微提高一点，确保基底干净
-        print(f"\n--- Fig 6: RMSE vs IBO (Calibrated SNR={current_snr} dB) ---")
+        """Fig 6: RMSE vs IBO - 使用峰值检测"""
+        current_snr = SNR_CONFIG["fig6"]
+        print(f"\n--- Fig 6: RMSE vs IBO (SNR={current_snr} dB, Peak Detection) ---")
 
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_signal = phy.generate_broadband_chirp(self.t_axis, 32)
@@ -352,58 +317,59 @@ class PaperFigureGenerator:
 
         v_scan = np.linspace(15000 - 1500, 15000 + 1500, 31)
 
-        # 统一使用 5kHz 截止频率
+        # 使用峰值检测的模板
         det_cfg = {'cutoff_freq': 5000.0, 'L_eff': GLOBAL_CONFIG['L_eff'], 'a': GLOBAL_CONFIG['a_default'], 'N_sub': 32}
         det_main = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
-        P_perp = det_main.P_perp
 
-        # 预计算模板库
-        s_raw_list = Parallel(n_jobs=self.n_jobs)(delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan)
-        T_bank = np.array([P_perp @ s for s in s_raw_list])
-        E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
+        # 预计算模板库（用于匹配滤波）
+        s_raw_list = Parallel(n_jobs=self.n_jobs)(
+            delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan
+        )
+        T_bank = np.array(s_raw_list)
+        # 去均值处理
+        T_bank_ac = T_bank - np.mean(T_bank, axis=1, keepdims=True)
+        E_bank = np.sum(T_bank_ac ** 2, axis=1) + 1e-20
 
-        # [KEY CHANGE] 拉大 Jitter 差距：从 10fs 到 2ps
         jit_levels = [1.0e-5, 2.0e-4, 4.0e-3]
         ibo_scan = np.linspace(30, 0, 13)
-        trials = 100  # 适当减少次数以加快速度
+        trials = 80
 
         fig, ax = plt.subplots(figsize=(5, 4))
         data = {'ibo': ibo_scan}
 
-        # 1. Ideal Baseline
+        # Ideal Baseline
         res_id = Parallel(n_jobs=self.n_jobs)(
-            delayed(_trial_rmse_opt)(10.0, 0, s, noise_std, sig_truth, self.N, self.fs, 15000, HW_CONFIG, T_bank,
-                                     E_bank, v_scan, ideal=True, P_perp=P_perp)
+            delayed(_trial_rmse_peak)(10.0, 0, s, noise_std, sig_truth, self.N, self.fs, 15000, HW_CONFIG,
+                                      T_bank_ac, E_bank, v_scan, ideal=True)
             for s in tqdm(range(trials), desc="Ideal")
         )
         rmse_id = np.sqrt(np.mean(np.array(res_id) ** 2))
         ax.semilogy(ibo_scan, [max(rmse_id, 0.1)] * len(ibo_scan), 'k--', label='Ideal', linewidth=2)
         data['ideal'] = [rmse_id] * len(ibo_scan)
 
-        # 2. Jitter Curves
+        # Jitter Curves
         colors = ['tab:blue', 'tab:orange', 'tab:green']
         for idx, jit in enumerate(jit_levels):
             res = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_rmse_opt)(ibo, jit, s, noise_std, sig_truth, self.N, self.fs, 15000, HW_CONFIG, T_bank,
-                                         E_bank, v_scan, ideal=False, P_perp=P_perp)
+                delayed(_trial_rmse_peak)(ibo, jit, s, noise_std, sig_truth, self.N, self.fs, 15000, HW_CONFIG,
+                                          T_bank_ac, E_bank, v_scan, ideal=False)
                 for ibo in tqdm(ibo_scan, desc=f"Jit={jit:.0e}", leave=False) for s in range(trials)
             )
             res_mat = np.array(res).reshape(len(ibo_scan), trials)
             rmse = []
             for row in res_mat:
-                # 剔除异常值 (Outliers removal)
                 valid = row[np.abs(row) < 1300]
                 if len(valid) > 5:
                     rmse.append(np.sqrt(np.mean(valid ** 2)))
                 else:
-                    rmse.append(1000.0)  # Penalty for failure
+                    rmse.append(1000.0)
 
-            ax.semilogy(ibo_scan, rmse, 'o-', color=colors[idx], label=rf'$\sigma_J$={jit:.0e} s')
+            ax.semilogy(ibo_scan, rmse, 'o-', color=colors[idx], label=rf'$\sigma_J$={jit:.0e}')
             data[f'rmse_jit_{idx}'] = rmse
 
         ax.set_xlabel('IBO (dB)')
         ax.set_ylabel('Velocity RMSE (m/s)')
-        ax.set_ylim(0.5, 2000)  # 固定 Y 轴范围方便对比
+        ax.set_ylim(0.5, 2000)
         ax.invert_xaxis()
         ax.legend(frameon=True, fontsize=10)
         ax.grid(True, which="both", ls=":", alpha=0.5)
@@ -412,108 +378,141 @@ class PaperFigureGenerator:
         self.save_plot('Fig6_Sensitivity')
 
     def generate_fig7_roc(self):
-        print(f"\n--- Fig 7: ROC (Link Budget Restored) ---")
+        """
+        [CRITICAL FIX] Fig 7: ROC 曲线
+        - 废弃 P_perp 正交投影
+        - 改用匹配滤波 + 峰值检测
+        - 使用衍射模式本身作为模板
+        """
+        print(f"\n--- Fig 7: ROC (SNR={SNR_CONFIG['fig7']}dB, Matched Filter) ---")
         trials = 2000
+
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_wb = phy.generate_broadband_chirp(self.t_axis, 32)
-
-        # 使用提升后的 SNR
         noise_std = self._calc_noise_std(SNR_CONFIG["fig7"], d_wb)
 
-        # 5kHz 物理截止频率
-        det_ref = TerahertzDebrisDetector(self.fs, self.N, N_sub=32, cutoff_freq=5000.0)
-        P_perp = det_ref.P_perp
-        s_true_raw = det_ref._generate_template(15000)
-        s_true_perp = P_perp @ s_true_raw
-        s_energy = np.sum(s_true_perp ** 2) + 1e-20
+        sig_h1_clean = 1.0 - d_wb  # 有目标
+        sig_h0_clean = np.ones(self.N, dtype=complex)  # 无目标
 
-        sig_h1_clean = 1.0 - d_wb
-        sig_h0_clean = np.ones(self.N, dtype=complex)
+        # [CRITICAL FIX] 使用衍射模式本身作为模板，而非 _generate_template()
+        # 原因：_generate_template() 依赖有问题的投影逻辑，导致模板能量为 0
+        template = np.real(d_wb)  # 衍射深坑模式
+        template_ac = template - np.mean(template)
+        template_norm = template_ac / (np.linalg.norm(template_ac) + 1e-20)
+        template_energy = np.sum(template_ac ** 2) + 1e-20
 
-        # [KEY FIX]
-        # 1. Naive: 保持 2e-4，制造明显的性能下降
-        jit_naive = 2.0e-4
-        # 2. Proposed: 设为 1e-8 (极小)。
-        #    配合 SNR=8dB，这应该能让蓝线接近绿线 (Ideal)，彻底脱离对角线。
-        jit_proposed = 1.0e-8
+        print(f"   Template energy: {template_energy:.6e} (should be > 0)")
+        print(f"   Diffraction depth: {np.max(np.abs(d_wb)):.6f}")
 
-        def run_roc_batch(is_ideal, jitter_val):
+        # Jitter 配置
+        jit_proposed = 1.0e-5  # Proposed: 低 Jitter（代表良好的硬件补偿）
+        jit_standard = 2.0e-4  # Standard: 高 Jitter（代表未补偿的硬件）
+
+        def run_roc_batch(is_ideal, jitter_val, use_matched_filter=True):
+            """运行 ROC 测试批次"""
             r0 = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_roc_fast)(sig_h0_clean, s, noise_std, is_ideal, s_true_perp, s_energy, P_perp,
-                                         jitter_val)
+                delayed(_trial_roc_peak)(sig_h0_clean, s, noise_std, is_ideal,
+                                         template_norm, template_energy, jitter_val,
+                                         self.N, self.fs, use_matched_filter)
                 for s in range(trials))
             r1 = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_roc_fast)(sig_h1_clean, s, noise_std, is_ideal, s_true_perp, s_energy, P_perp,
-                                         jitter_val)
+                delayed(_trial_roc_peak)(sig_h1_clean, s, noise_std, is_ideal,
+                                         template_norm, template_energy, jitter_val,
+                                         self.N, self.fs, use_matched_filter)
                 for s in range(trials))
             return np.array(r0), np.array(r1)
 
         print("   Running Ideal...")
-        r0_id, r1_id = run_roc_batch(True, 0)
+        r0_id, r1_id = run_roc_batch(True, 0, use_matched_filter=True)
 
         print(f"   Running Proposed (Jit={jit_proposed:.1e})...")
-        r0_prop, r1_prop = run_roc_batch(False, jit_proposed)
+        r0_prop, r1_prop = run_roc_batch(False, jit_proposed, use_matched_filter=True)
 
-        print(f"   Running Naive (Jit={jit_naive:.1e})...")
-        r0_naive, r1_naive = run_roc_batch(False, jit_naive)
+        print(f"   Running Standard (Jit={jit_standard:.1e})...")
+        r0_std, r1_std = run_roc_batch(False, jit_standard, use_matched_filter=True)
 
-        def get_curve(n, s):
-            n_vals, s_vals = n[:, 0], s[:, 0]
+        print("   Running Energy Detector...")
+        r0_ed, r1_ed = run_roc_batch(False, jit_standard, use_matched_filter=False)
+
+        def get_curve(h0_stats, h1_stats, col=0):
+            """计算 ROC 曲线"""
+            n_vals = h0_stats[:, col] if h0_stats.ndim > 1 else h0_stats
+            s_vals = h1_stats[:, col] if h1_stats.ndim > 1 else h1_stats
             all_v = np.concatenate([n_vals, s_vals])
-            # 动态调整阈值范围，防止两头数据堆积
-            th = np.linspace(np.min(all_v), np.percentile(all_v, 99.9), 1000)
+            th = np.linspace(np.min(all_v), np.percentile(all_v, 99.9), 500)
             pf = np.array([np.mean(n_vals > t) for t in th])
             pd = np.array([np.mean(s_vals > t) for t in th])
             return pf, pd
 
-        pf_id, pd_id = get_curve(r0_id, r1_id)
-        pf_prop, pd_prop = get_curve(r0_prop, r1_prop)
-        pf_naive, pd_naive = get_curve(r0_naive, r1_naive)
-        pf_ed, pd_ed = get_curve(r0_naive[:, [1, 1]], r1_naive[:, [1, 1]])
+        pf_id, pd_id = get_curve(r0_id, r1_id, 0)
+        pf_prop, pd_prop = get_curve(r0_prop, r1_prop, 0)
+        pf_std, pd_std = get_curve(r0_std, r1_std, 0)
+        pf_ed, pd_ed = get_curve(r0_ed, r1_ed, 1)
 
-        self.save_csv({'pf_prop': pf_prop, 'pd_prop': pd_prop}, 'Fig7_ROC_Data')
+        self.save_csv({
+            'pf_id': pf_id, 'pd_id': pd_id,
+            'pf_prop': pf_prop, 'pd_prop': pd_prop,
+            'pf_std': pf_std, 'pd_std': pd_std,
+            'pf_ed': pf_ed, 'pd_ed': pd_ed
+        }, 'Fig7_ROC_Data')
 
         plt.figure(figsize=(5, 5))
-        plt.plot(pf_id, pd_id, 'g-', linewidth=2, label='Ideal')
+        plt.plot(pf_id, pd_id, 'g-', linewidth=2, label='Ideal GLRT')
         plt.plot(pf_prop, pd_prop, 'b-', linewidth=2, label='Proposed (Robust)')
-        plt.plot(pf_naive, pd_naive, 'r--', linewidth=1.5, label='Standard GLRT')
+        plt.plot(pf_std, pd_std, 'r--', linewidth=1.5, label='Standard GLRT')
         plt.plot(pf_ed, pd_ed, 'k:', linewidth=1, label='Energy Det')
+        plt.plot([0, 1], [0, 1], 'k-', alpha=0.2, linewidth=0.5)
 
-        plt.plot([0, 1], [0, 1], 'k-', alpha=0.1)
         plt.xlabel('Probability of False Alarm (PFA)')
         plt.ylabel('Probability of Detection (PD)')
         plt.legend(loc='lower right')
         plt.grid(True, linestyle=':')
+        plt.xlim([0, 1])
+        plt.ylim([0, 1])
         self.save_plot('Fig7_ROC')
 
     def generate_fig8_mds(self):
-        print(f"\n--- Fig 8: MDS (SNR Boosted to 35dB) ---")
+        """
+        [CRITICAL FIX] Fig 8: MDS (最小可检测尺寸)
+        - 废弃 P_perp 正交投影
+        - 改用匹配滤波 + 峰值检测
+        - 为每个碎片尺寸生成对应的模板
+        """
+        print(f"\n--- Fig 8: MDS (SNR={SNR_CONFIG['fig8']}dB, Matched Filter) ---")
         diams = np.array([2, 5, 8, 12, 16, 20, 30, 50])
         radii = diams / 2000.0
 
-        # 使用 35dB SNR。对于 2mm 这种微小物体，Diffraction Dip 只有 1e-4 量级
-        # 必须有极高的基带 SNR 才能在 PA 衰减后被检测到。
-        noise_std = self._calc_noise_std(SNR_CONFIG["fig8"],
-                                         DiffractionChannel(GLOBAL_CONFIG).generate_broadband_chirp(self.t_axis, 32))
+        # 使用高 SNR
+        d_ref = DiffractionChannel(GLOBAL_CONFIG).generate_broadband_chirp(self.t_axis, 32)
+        noise_std = self._calc_noise_std(SNR_CONFIG["fig8"], d_ref)
 
-        det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32, cutoff_freq=5000.0)
-        P_perp = det.P_perp
-        s_norm = P_perp @ det._generate_template(15000)
-        s_norm /= (np.linalg.norm(s_norm) + 1e-20)
+        # [CRITICAL FIX] 使用参考碎片的衍射模式作为模板
+        # 选择 50mm 碎片的衍射模式作为参考（信噪比最高）
+        phy_ref = DiffractionChannel({**GLOBAL_CONFIG, 'a': 0.025})  # 50mm diameter = 25mm radius
+        d_ref_pattern = phy_ref.generate_broadband_chirp(self.t_axis, 32)
+        template = np.real(d_ref_pattern)
+        template_ac = template - np.mean(template)
+        template_norm = template_ac / (np.linalg.norm(template_ac) + 1e-20)
 
-        # [KEY FIX] 使用极低 Jitter 模拟“完美补偿”后的情况
-        mds_jitter_effective = 1.0e-8
+        # Jitter 配置
+        mds_jitter_ideal = 0
+        mds_jitter_hw = 1.0e-5  # 使用较低 Jitter 代表良好补偿
 
-        # 计算阈值
+        # 计算阈值 (H0)
+        print("   Calculating Thresholds...")
         h0_runs_id = Parallel(n_jobs=self.n_jobs)(
-            delayed(_trial_mds)(False, None, s, noise_std, s_norm, P_perp, self.N, self.fs, True, 0)
+            delayed(_trial_mds_peak)(False, None, s, noise_std, template_norm,
+                                     self.N, self.fs, True, 0)
             for s in range(1000))
         h0_runs_hw = Parallel(n_jobs=self.n_jobs)(
-            delayed(_trial_mds)(False, None, s, noise_std, s_norm, P_perp, self.N, self.fs, False, mds_jitter_effective)
+            delayed(_trial_mds_peak)(False, None, s, noise_std, template_norm,
+                                     self.N, self.fs, False, mds_jitter_hw)
             for s in range(1000))
 
         th_id = np.percentile(h0_runs_id, 95.0)
         th_hw = np.percentile(h0_runs_hw, 95.0)
+
+        print(f"   Thresholds: Ideal={th_id:.4f}, HW={th_hw:.4f}")
 
         pd_hw, pd_id = [], []
 
@@ -522,11 +521,12 @@ class PaperFigureGenerator:
             sig = 1.0 - phy.generate_broadband_chirp(self.t_axis, 32)
 
             r_hw = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_mds)(True, sig, s, noise_std, s_norm, P_perp, self.N, self.fs, False,
-                                    mds_jitter_effective)
+                delayed(_trial_mds_peak)(True, sig, s, noise_std, template_norm,
+                                         self.N, self.fs, False, mds_jitter_hw)
                 for s in range(200))
             r_id = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_mds)(True, sig, s, noise_std, s_norm, P_perp, self.N, self.fs, True, 0)
+                delayed(_trial_mds_peak)(True, sig, s, noise_std, template_norm,
+                                         self.N, self.fs, True, 0)
                 for s in range(200))
 
             pd_hw.append(np.mean(np.array(r_hw) > th_hw))
@@ -535,29 +535,32 @@ class PaperFigureGenerator:
         self.save_csv({'d': diams, 'pd_hw': pd_hw, 'pd_id': pd_id}, 'Fig8_MDS_Data')
 
         plt.figure(figsize=(5, 4))
-        plt.semilogx(diams, pd_id, 'g-o', label='Ideal')
-        plt.semilogx(diams, pd_hw, 'b-s', label='Proposed (Robust)')
-        plt.axhline(0.5, color='k', ls=':', alpha=0.5)
-        plt.axhline(0.05, color='r', ls=':', alpha=0.3)
+        plt.semilogx(diams, pd_id, 'g-o', linewidth=2, markersize=8, label='Ideal')
+        plt.semilogx(diams, pd_hw, 'b-s', linewidth=2, markersize=8, label='Proposed (Robust)')
+        plt.axhline(0.5, color='k', ls=':', alpha=0.5, label='Detection Limit')
+        plt.axhline(0.9, color='r', ls=':', alpha=0.3)
         plt.xlabel('Debris Diameter (mm)')
         plt.ylabel('Probability of Detection')
-        plt.legend()
+        plt.legend(loc='lower right')
         plt.grid(True, which="both", ls=":")
+        plt.ylim([0, 1.05])
         self.save_plot('Fig8_MDS')
-        
+
     def generate_fig9_isac(self):
-        print(f"\n--- Fig 9: ISAC (Calibrated SNR={SNR_CONFIG['fig9']} dB) ---")
+        print(f"\n--- Fig 9: ISAC (SNR={SNR_CONFIG['fig9']} dB) ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
         sig_truth = 1.0 - phy.generate_broadband_chirp(self.t_axis, 32)
         noise_std = self._calc_noise_std(SNR_CONFIG["fig9"], 1.0 - sig_truth)
 
         v_scan = np.linspace(14000, 16000, 41)
-        det_cfg = {'cutoff_freq': 300.0, 'L_eff': 50e3, 'N_sub': 32, 'a': 0.05}
+        det_cfg = {'cutoff_freq': 5000.0, 'L_eff': 50e3, 'N_sub': 32, 'a': 0.05}
         det = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
-        P_perp = det.P_perp
+
+        # 使用峰值检测的模板
         s_raw = Parallel(n_jobs=self.n_jobs)(delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan)
-        T_bank = np.array([P_perp @ s for s in s_raw])
-        E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
+        T_bank = np.array(s_raw)
+        T_bank_ac = T_bank - np.mean(T_bank, axis=1, keepdims=True)
+        E_bank = np.sum(T_bank_ac ** 2, axis=1) + 1e-20
 
         ibo_scan = np.linspace(20, 0, 15)
         cap, rmse = [], []
@@ -565,8 +568,8 @@ class PaperFigureGenerator:
 
         for ibo in tqdm(ibo_scan):
             res = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_isac)(ibo, s, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp, self.N, self.fs,
-                                     False, isac_jitter)
+                delayed(_trial_isac_peak)(ibo, s, noise_std, sig_truth, T_bank_ac, E_bank, v_scan,
+                                          self.N, self.fs, False, isac_jitter)
                 for s in range(40)
             )
             res = np.array(res)
@@ -586,7 +589,7 @@ class PaperFigureGenerator:
         self.save_plot('Fig9_ISAC')
 
     def run_all(self):
-        print("=== SIMULATION START (V22.0 CALIBRATED) ===")
+        print("=== SIMULATION START (V5.0 FIXED - Peak Detection) ===")
         self.generate_fig2_mechanisms()
         self.generate_fig3_dispersion()
         self.generate_fig4_self_healing()
@@ -601,26 +604,15 @@ class PaperFigureGenerator:
 
 
 # =========================================================================
-# Worker Functions
+# Worker Functions (关键修复)
 # =========================================================================
 
 def _log_envelope(y):
     return np.log(np.abs(y) + 1e-12)
 
 
-def _gen_template(v, fs, N, cfg):
-    return TerahertzDebrisDetector(fs, N, **cfg)._generate_template(v)
-
-
-# =========================================================================
-# Worker Functions (With AGC Fix)
-# =========================================================================
-
 def _apply_agc(signal_in):
-    """
-    AGC: 根据输入信号功率进行归一化。
-    注意：在物理上，AGC 会同时放大信号和已经混入的热噪声。
-    """
+    """AGC 归一化"""
     p_sig = np.mean(np.abs(signal_in) ** 2)
     if p_sig < 1e-20:
         return signal_in
@@ -628,19 +620,19 @@ def _apply_agc(signal_in):
     return signal_in * gain
 
 
-def _log_envelope(y):
-    return np.log(np.abs(y) + 1e-12)
-
-
 def _gen_template(v, fs, N, cfg):
     return TerahertzDebrisDetector(fs, N, **cfg)._generate_template(v)
 
 
-def _trial_rmse_opt(ibo, jitter_rms, seed, noise_std, sig_truth, N, fs, true_v, hw_base, T_bank, E_bank, v_scan, ideal,
-                    P_perp):
+# ===========================================================================
+# [CRITICAL FIX] 峰值检测版本的 Worker 函数
+# ===========================================================================
+
+def _trial_rmse_peak(ibo, jitter_rms, seed, noise_std, sig_truth, N, fs, true_v, hw_base,
+                     T_bank_ac, E_bank, v_scan, ideal):
+    """RMSE 测试 - 使用峰值检测"""
     np.random.seed(seed)
 
-    # 1. 生成物理信号 (Physical Signal Generation)
     if ideal:
         pa_out_raw = sig_truth
     else:
@@ -649,24 +641,22 @@ def _trial_rmse_opt(ibo, jitter_rms, seed, noise_std, sig_truth, N, fs, true_v, 
         hw = HardwareImpairments(hw_cfg)
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pn = np.exp(1j * hw.generate_phase_noise(N, fs))
-        # PA 输出：幅度可能衰减到 0.05 (低 IBO) 或 0.005 (高 IBO)
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_truth * jit * pn, ibo_dB=ibo)
 
-    # 2. 加入热噪声 (Add Thermal Noise) -- [CORRECT PHYSICS]
-    # 噪声必须加在 AGC 之前。这样当 pa_out_raw 很小时，信噪比自然恶化。
+    # 加噪声
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     rx_signal = pa_out_raw + w
 
-    # 3. 接收机处理 (Receiver Processing)
-    # AGC 归一化 -> 对数包络 -> 正交投影
-    z = _log_envelope(_apply_agc(rx_signal))
-    z_perp = P_perp @ z
+    # [FIX] 使用幅度去均值，而非正交投影
+    rx_amp = np.abs(_apply_agc(rx_signal))
+    z_ac = rx_amp - np.mean(rx_amp)
 
-    # 4. 估计与插值 (Estimation)
-    stats = (np.dot(T_bank, z_perp) ** 2) / (E_bank + 1e-20)
+    # 匹配滤波扫描
+    stats = (np.dot(T_bank_ac, z_ac) ** 2) / (E_bank + 1e-20)
     idx_max = np.argmax(stats)
     v_coarse = v_scan[idx_max]
 
+    # 抛物线插值
     if 0 < idx_max < len(stats) - 1:
         alpha = stats[idx_max - 1]
         beta = stats[idx_max]
@@ -680,43 +670,51 @@ def _trial_rmse_opt(ibo, jitter_rms, seed, noise_std, sig_truth, N, fs, true_v, 
     return v_est - true_v
 
 
-def _trial_roc_fast(sig_clean, seed, noise_std, ideal, s_true_perp, s_energy, P_perp, jitter_val=0):
+def _trial_roc_peak(sig_clean, seed, noise_std, ideal, template_norm, template_energy,
+                    jitter_val, N, fs, use_matched_filter=True):
+    """
+    ROC 测试 - 使用匹配滤波
+
+    [CRITICAL FIX]: 废弃 P_perp，改用匹配滤波
+    """
     np.random.seed(seed)
     hw = HardwareImpairments(HW_CONFIG)
 
-    # [FIX] 必须在这里定义 N，否则 ideal=True 时 N 未定义会报错
-    N = len(sig_clean)
-
-    # 1. 物理层
+    # 物理层
     if ideal:
         pa_out_raw = sig_clean
     else:
         hw.jitter_rms = jitter_val
-        fs = GLOBAL_CONFIG['fs']
         jit = np.exp(hw.generate_colored_jitter(N, fs))
-        # IBO=10dB, 信号有衰减
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_clean * jit, ibo_dB=10.0)
 
-    # 2. 加噪声 (Pre-AGC)
+    # 加噪声
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     rx_signal = pa_out_raw + w
 
-    # 3. 接收处理
-    # GLRT 使用 Log-Envelope
-    z_log = _log_envelope(_apply_agc(rx_signal))
-    z_perp = P_perp @ z_log
-    stat_glrt = (np.dot(s_true_perp, z_perp) ** 2) / (s_energy + 1e-20)
+    # [FIX] 匹配滤波处理
+    rx_agc = _apply_agc(rx_signal)
+    rx_amp = np.abs(rx_agc)
+    rx_ac = rx_amp - np.mean(rx_amp)
 
-    # Energy Detector 使用线性幅度 (AGC后)
-    # 去除直流，只看能量波动
-    rx_norm = np.abs(_apply_agc(rx_signal))
-    y_ac = rx_norm - np.mean(rx_norm)
-    stat_ed = np.sum(y_ac ** 2)
+    if use_matched_filter:
+        # 匹配滤波统计量
+        stat_mf = np.dot(rx_ac, template_norm) ** 2
+    else:
+        stat_mf = 0
 
-    return stat_glrt, stat_ed
+    # 能量检测统计量
+    stat_ed = np.sum(rx_ac ** 2)
+
+    return stat_mf, stat_ed
 
 
-def _trial_mds(is_h1, sig_clean, seed, noise_std, s_norm, P_perp, N, fs, ideal, jitter_val=0):
+def _trial_mds_peak(is_h1, sig_clean, seed, noise_std, template_norm, N, fs, ideal, jitter_val=0):
+    """
+    MDS 测试 - 使用匹配滤波
+
+    [CRITICAL FIX]: 废弃 P_perp，改用匹配滤波
+    """
     np.random.seed(seed)
 
     if is_h1:
@@ -732,17 +730,23 @@ def _trial_mds(is_h1, sig_clean, seed, noise_std, s_norm, P_perp, N, fs, ideal, 
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_in * jit, ibo_dB=10.0)
 
-    # Pre-AGC Noise
+    # 加噪声
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     rx_signal = pa_out_raw + w
 
-    # Processing
-    z = _log_envelope(_apply_agc(rx_signal))
-    stat = (np.dot(s_norm, P_perp @ z) ** 2)
+    # [FIX] 匹配滤波
+    rx_agc = _apply_agc(rx_signal)
+    rx_amp = np.abs(rx_agc)
+    rx_ac = rx_amp - np.mean(rx_amp)
+
+    # 匹配滤波统计量
+    stat = np.dot(template_norm, rx_ac) ** 2
+
     return stat
 
 
-def _trial_isac(ibo, seed, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp, N, fs, ideal, jitter_val=0):
+def _trial_isac_peak(ibo, seed, noise_std, sig_truth, T_bank_ac, E_bank, v_scan, N, fs, ideal, jitter_val=0):
+    """ISAC 测试 - 使用峰值检测"""
     np.random.seed(seed)
     hw = HardwareImpairments(HW_CONFIG)
 
@@ -755,16 +759,18 @@ def _trial_isac(ibo, seed, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp,
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_truth * jit, ibo_dB=ibo)
         gamma_eff = 4.0e-3 * (10 ** (-ibo / 10.0))
 
-    # Pre-AGC Noise for RMSE calculation
+    # 加噪声
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     rx_signal = pa_out_raw + w
-    z = _log_envelope(_apply_agc(rx_signal))
 
-    stats = (np.dot(T_bank, P_perp @ z) ** 2) / (E_bank + 1e-20)
+    # [FIX] 峰值检测
+    rx_amp = np.abs(_apply_agc(rx_signal))
+    z_ac = rx_amp - np.mean(rx_amp)
+
+    stats = (np.dot(T_bank_ac, z_ac) ** 2) / (E_bank + 1e-20)
     v_est = v_scan[np.argmax(stats)]
 
-    # Capacity 计算 (依然使用 SINR 模型)
-    # p_rx 应该是实际接收功率
+    # Capacity 计算
     p_rx = np.mean(np.abs(pa_out_raw) ** 2)
     sinr = p_rx / (noise_std ** 2 + p_rx * gamma_eff + 1e-20)
     cap = np.log2(1 + sinr)

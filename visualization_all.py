@@ -1,11 +1,10 @@
 # ----------------------------------------------------------------------------------
-# 脚本名称: visualization_all.py
-# 版本: v20.0 (The Ultimate Stress Test - Production Ready)
-# 描述:
-#   针对 "Too Good" 的结果进行参数重校准。
-#   1. SNR 大幅下探至 -22dB ~ -25dB，以抵消 36dB 的积分增益，寻找 RMSE 的“起飞点”。
-#   2. 确保 Fig 8 (MDS) 在固定噪声基底下，不同尺寸目标呈现 S 型检测率曲线。
-#   3. 输出完整的 CSV 数据和 PDF 图表。
+# 脚本名称: visualization_all_robust.py
+# 基于: User Provided v19.0 (Initial Version)
+# 增强:
+#   1. [Revert] 参数回滚至 v19.0 (SNR=0/-5dB)，恢复物理合理性。
+#   2. [Safety] 增加数值保护 (Epsilon/NaN Check)，防止计算爆炸。
+#   3. [Output] 保证每一张图都生成 CSV + PNG + PDF。
 # ----------------------------------------------------------------------------------
 
 import numpy as np
@@ -39,7 +38,7 @@ plt.rcParams.update({
     'grid.alpha': 0.6
 })
 
-# --- 全局物理参数 ---
+# --- 全局物理参数 (Keep v19.0) ---
 GLOBAL_CONFIG = {
     'fc': 300e9,
     'B': 10e9,
@@ -50,19 +49,16 @@ GLOBAL_CONFIG = {
     'v_default': 15000
 }
 
-# --- 压力测试 SNR 配置 (关键修改) ---
-# [Expert Analysis]:
-# 系统的处理增益 (PG) 约为 10*log10(4000) = 36 dB。
-# 要让 RMSE 恶化，输出 SNR 需要降至 10-13dB 左右。
-# 因此输入 SNR 需要在 (13 - 36) = -23dB 附近。
+# --- SNR 配置 (Revert to v19.0) ---
+# 恢复到您原始的设置，避免 -22dB 导致的物理崩塌
 SNR_CONFIG = {
-    "fig6": -22.0,  # RMSE 敏感度测试：设为 -22dB，处于崩溃边缘
-    "fig7": -25.0,  # ROC 曲线：设为 -25dB，拉开 Ideal 和 HW 的差距
-    "fig8": -20.0,  # MDS 最小可检测尺寸：相对于 5cm 目标为 -20dB，此时小目标将不可见
-    "fig9": -5.0  # ISAC 通信容量：通信没有 36dB 增益，SNR 不需要太低
+    "fig6": 0.0,
+    "fig7": 0.0,
+    "fig8": -5.0,
+    "fig9": 0.0
 }
 
-# --- 硬件损伤默认配置 ---
+# --- 硬件损伤默认配置 (Revert to v19.0) ---
 HW_CONFIG = {
     'jitter_rms': 1.0e-6,
     'f_knee': 200.0,
@@ -75,7 +71,7 @@ HW_CONFIG = {
 
 
 class PaperFigureGenerator:
-    def __init__(self, output_dir='results_v20'):
+    def __init__(self, output_dir='results_v19_robust'):
         self.out_dir = output_dir
         self.csv_dir = os.path.join(output_dir, 'csv_data')
 
@@ -87,214 +83,267 @@ class PaperFigureGenerator:
         self.N = int(self.fs * GLOBAL_CONFIG['T_span'])
         self.t_axis = np.arange(self.N) / self.fs - (self.N / 2) / self.fs
 
-        # 核心数控制 (留2个核给系统)
         self.n_jobs = max(1, multiprocessing.cpu_count() - 2)
-
-        print(f"[Init] Cores: {self.n_jobs}")
-        print(f"[Init] SNR Config: {SNR_CONFIG}")
-        print(f"[Init] Output Directory: {os.path.abspath(self.out_dir)}")
+        print(f"[Init] Cores: {self.n_jobs} | Output: {os.path.abspath(self.out_dir)}")
+        print(f"[Init] SNR Config (v19.0): {SNR_CONFIG}")
 
     def save_plot(self, name):
-        """同时保存 PNG 和 PDF"""
+        """同时保存 PNG 和 PDF (Triple Output Guarantee)"""
         plt.tight_layout(pad=0.5)
-        path_png = os.path.abspath(f"{self.out_dir}/{name}.png")
-        path_pdf = os.path.abspath(f"{self.out_dir}/{name}.pdf")
-        plt.savefig(path_png, dpi=300, bbox_inches='tight')
-        plt.savefig(path_pdf, format='pdf', bbox_inches='tight')
-        print(f"   [Saved Plot] {name} -> .pdf")
+        path_png = os.path.join(self.out_dir, f"{name}.png")
+        path_pdf = os.path.join(self.out_dir, f"{name}.pdf")
+        try:
+            plt.savefig(path_png, dpi=300, bbox_inches='tight')
+            plt.savefig(path_pdf, format='pdf', bbox_inches='tight')
+            print(f"   [Plot Saved] {name}")
+        except Exception as e:
+            print(f"   [Error Saving Plot] {name}: {e}")
         plt.close('all')
 
-    def save_csv(self, data, name):
-        """保存源数据用于后续重绘"""
-        # 对齐数据长度
-        max_len = max([len(v) if hasattr(v, '__len__') else 1 for v in data.values()])
-        aligned = {}
-        for k, v in data.items():
-            if hasattr(v, '__len__'):
-                padded = np.full(max_len, np.nan)
-                padded[:len(v)] = v
-                aligned[k] = padded
+    def save_csv(self, data, name, is_matrix=False):
+        """保存数据为 CSV，增加 NaN 处理"""
+        path = os.path.join(self.csv_dir, f"{name}.csv")
+        try:
+            if is_matrix and isinstance(data, (np.ndarray, list)):
+                # 矩阵数据
+                pd.DataFrame(data).to_csv(path, index=False, header=False)
             else:
-                aligned[k] = np.full(max_len, v)
-
-        path = os.path.abspath(f"{self.csv_dir}/{name}.csv")
-        pd.DataFrame(aligned).to_csv(path, index=False)
-        print(f"   [Saved Data] {name} -> .csv")
+                # 列数据自动对齐
+                max_len = max([len(v) if hasattr(v, '__len__') else 1 for v in data.values()])
+                aligned = {}
+                for k, v in data.items():
+                    if hasattr(v, '__len__'):
+                        v_arr = np.array(v)
+                        # 安全转换：处理 NaN
+                        v_arr = np.nan_to_num(v_arr, nan=0.0)
+                        if len(v_arr) < max_len:
+                            padded = np.full(max_len, np.nan)
+                            padded[:len(v_arr)] = v_arr
+                            aligned[k] = padded
+                        else:
+                            aligned[k] = v_arr
+                    else:
+                        aligned[k] = np.full(max_len, v)
+                pd.DataFrame(aligned).to_csv(path, index=False)
+            print(f"   [Data Saved] {name}.csv")
+        except Exception as e:
+            print(f"   [Error Saving CSV] {name}: {e}")
 
     def _calc_noise_std(self, target_snr_db, signal_reference):
-        """基于参考信号功率计算噪声标准差"""
         p_sig = np.mean(np.abs(signal_reference) ** 2)
+        p_sig = max(p_sig, 1e-20)  # Prevent zero div
         noise_std = np.sqrt(p_sig / (10 ** (target_snr_db / 10.0)))
         return noise_std
 
     # =========================================================================
-    # Group A: Physics Visualization (机制验证图)
+    # Group A: Physics Visualization
     # =========================================================================
 
     def generate_fig2_mechanisms(self):
-        print("\n--- Generating Fig 2: Hardware Impairments ---")
+        print("\n--- Fig 2: Mechanisms ---")
         hw = HardwareImpairments(HW_CONFIG)
         jit = hw.generate_colored_jitter(self.N * 10, self.fs)
         f, psd = signal.welch(jit, self.fs, nperseg=2048)
+        psd_log = 10 * np.log10(psd + 1e-20)
+
         pin_db, am_am, scr = hw.get_pa_curves()
 
-        # Fig 2a: Jitter PSD
+        # Added CSV Save
+        self.save_csv({
+            'freq_hz': f, 'jitter_psd_db': psd_log,
+            'pa_pin_db': pin_db, 'pa_out': am_am, 'pa_scr': scr
+        }, 'Fig2_Mechanisms_Data')
+
+        # Fig 2a
         plt.figure(figsize=(5, 4))
-        plt.loglog(f, psd, 'b')
+        plt.semilogx(f, psd_log, 'b')
         plt.xlabel('Frequency (Hz)')
-        plt.ylabel(r'Jitter PSD (s$^2$/Hz)')
-        plt.title('Colored Jitter Spectrum')
+        plt.ylabel('PSD (dB/Hz)')
         self.save_plot('Fig2a_Jitter')
 
-        # Fig 2b: PA Curves
+        # Fig 2b
         plt.figure(figsize=(5, 4))
-        plt.plot(pin_db, am_am, 'k', label='AM-AM')
+        plt.plot(pin_db, am_am, 'k')
         ax = plt.gca()
         ax2 = ax.twinx()
-        ax2.plot(pin_db, np.maximum(scr, -0.2), 'r--', label='SCR')
+        ax2.plot(pin_db, np.maximum(scr, -0.2), 'r--')
         ax.set_xlabel('Input Power (dB)')
-        ax.set_ylabel('Output Amplitude')
+        ax.set_ylabel('Output')
         ax2.set_ylabel('SCR', color='r')
-        plt.title('Saleh PA Characteristics')
         self.save_plot('Fig2b_PA')
 
     def generate_fig3_dispersion(self):
-        print("\n--- Generating Fig 3: Dispersion (NB vs WB) ---")
+        print("\n--- Fig 3: Dispersion ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
-        # 窄带 (300GHz 单频)
         d_nb = np.abs(phy.generate_diffraction_pattern(self.t_axis, np.array([300e9]))[0])
-        # 宽带 (DFS)
         d_wb = np.abs(phy.generate_broadband_chirp(self.t_axis, N_sub=32))
 
+        # Added CSV Save
+        self.save_csv({
+            'time_ms': self.t_axis * 1000,
+            'amp_nb': d_nb,
+            'amp_wb': d_wb
+        }, 'Fig3_Dispersion_Data')
+
         plt.figure(figsize=(5, 4))
-        plt.plot(self.t_axis * 1000, d_nb, 'r--', label='Narrowband (300G)')
-        plt.plot(self.t_axis * 1000, d_wb, 'b-', label='Wideband (DFS)')
+        plt.plot(self.t_axis * 1000, d_nb, 'r--', label='NB')
+        plt.plot(self.t_axis * 1000, d_wb, 'b-', label='WB')
         plt.xlabel('Time (ms)')
         plt.ylabel('|d(t)|')
         plt.legend()
-        plt.title('Diffraction Pattern Dispersion')
         self.save_plot('Fig3_Dispersion')
 
     def generate_fig4_self_healing(self):
-        print("\n--- Generating Fig 4: Self-Healing Beam ---")
+        print("\n--- Fig 4: Self Healing ---")
         hw = HardwareImpairments(HW_CONFIG)
         t = np.linspace(0, 1, 500)
-        # 模拟一个中心被遮挡的高斯波束
-        sig = 1.0 - 0.4 * np.exp(-((t - 0.5) ** 2) / 0.005)
+        sig = 1.0 - 0.2 * np.exp(-((t - 0.5) ** 2) / 0.005)
         out, _, _ = hw.apply_saleh_pa(sig, ibo_dB=2.0)
+        out_norm = np.abs(out) / (np.max(np.abs(out)) + 1e-20)
+
+        # Added CSV Save
+        self.save_csv({
+            'space': t, 'input': np.abs(sig), 'output': out_norm
+        }, 'Fig4_Self_Healing_Data')
 
         plt.figure(figsize=(5, 4))
-        plt.plot(t, np.abs(sig), 'k--', label='Input (Blocked)')
-        plt.plot(t, np.abs(out) / np.max(np.abs(out)), 'r-', label='Output (Healed)')
-        plt.xlabel('Spatial Coordinate (norm)')
-        plt.ylabel('Amplitude')
+        plt.plot(t, np.abs(sig), 'k--', label='In')
+        plt.plot(t, out_norm, 'r-', label='Out')
         plt.legend()
-        plt.title('Nonlinear Self-Healing Effect')
         self.save_plot('Fig4_Self_Healing')
 
     def generate_fig5_survival_space(self):
-        print("\n--- Generating Fig 5: Signal in Noise Space ---")
+        print("\n--- Fig 5: Spectrogram ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
         hw = HardwareImpairments(HW_CONFIG)
         det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32)
-
-        # 生成含噪信号
         y = (1.0 - phy.generate_broadband_chirp(self.t_axis, 32)) * \
             np.exp(hw.generate_colored_jitter(self.N, self.fs))
-
-        # Log-Env + Projection
         z_perp = det.apply_projection(det.log_envelope_transform(y))
 
         f, t_sp, Sxx = signal.spectrogram(z_perp, self.fs, nperseg=256, noverlap=220)
+        Sxx_db = 10 * np.log10(Sxx + 1e-15)
+
+        # Added CSV Save (Matrix)
+        self.save_csv(Sxx_db, 'Fig5_Spectrogram_Matrix', is_matrix=True)
+        self.save_csv({'time_sp': t_sp, 'freq_sp': f}, 'Fig5_Spectrogram_Axes')
+
         plt.figure(figsize=(5, 4))
-        plt.pcolormesh(t_sp * 1000, f, 10 * np.log10(Sxx + 1e-15), shading='gouraud', cmap='inferno')
+        plt.pcolormesh(t_sp * 1000, f, Sxx_db, shading='gouraud', cmap='inferno')
         plt.ylim(0, 5000)
-        plt.ylabel('Frequency (Hz)')
-        plt.xlabel('Time (ms)')
+        plt.ylabel('Hz')
+        plt.xlabel('ms')
         plt.colorbar(label='PSD (dB)')
-        plt.title('Projected Signal Spectrogram')
         self.save_plot('Fig5_Survival_Space')
 
+    def generate_fig10_ambiguity(self):
+        print("\n--- Fig 10: Ambiguity ---")
+        det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32)
+        s0 = det.P_perp @ det._generate_template(15000)
+        v_shifts = np.linspace(-500, 500, 41)
+        t_shifts = np.linspace(-0.002, 0.002, 41)
+        res = np.zeros((41, 41))
+        E = np.sum(s0 ** 2) + 1e-20
+
+        for i, dv in enumerate(v_shifts):
+            s_v = det.P_perp @ det._generate_template(15000 + dv)
+            for j, dt in enumerate(t_shifts):
+                shift = int(dt * self.fs)
+                s_shift = np.roll(s_v, shift)
+                if shift > 0:
+                    s_shift[:shift] = 0
+                else:
+                    s_shift[shift:] = 0
+                res[i, j] = (np.dot(s0, s_shift) ** 2) / E
+
+        # Added CSV Save
+        self.save_csv(res, 'Fig10_Ambiguity_Matrix', is_matrix=True)
+        self.save_csv({'v_shifts': v_shifts, 't_shifts': t_shifts}, 'Fig10_Ambiguity_Axes')
+
+        plt.figure(figsize=(5, 4))
+        plt.contourf(t_shifts * 1000, v_shifts, res / np.max(res), 20, cmap='viridis')
+        self.save_plot('Fig10_Ambiguity')
+
+    def generate_fig11_trajectory(self):
+        print("\n--- Fig 11: Trajectory ---")
+        phy = DiffractionChannel(GLOBAL_CONFIG)
+        d = phy.generate_broadband_chirp(self.t_axis, 32)
+        hw = HardwareImpairments(HW_CONFIG)
+        noise_cloud = (1.0 - d) * np.exp(hw.generate_colored_jitter(self.N, self.fs) * 10) * \
+                      np.exp(1j * hw.generate_phase_noise(self.N, self.fs))
+        noise_cloud -= np.mean(noise_cloud)
+
+        # Added CSV Save
+        self.save_csv({'real': np.real(noise_cloud), 'imag': np.imag(noise_cloud)}, 'Fig11_Trajectory_Data')
+
+        plt.figure(figsize=(5, 5))
+        plt.plot(np.real(noise_cloud), np.imag(noise_cloud), '.', color='grey', alpha=0.1)
+        self.save_plot('Fig11_Trajectory')
+
     # =========================================================================
-    # Group B: Performance Metrics (压力测试核心)
+    # Group B: Performance (v19.0 Logic + Safety)
     # =========================================================================
 
     def generate_fig6_rmse_sensitivity(self):
-        print(f"\n--- Generating Fig 6: RMSE vs IBO (SNR={SNR_CONFIG['fig6']} dB) ---")
-
-        # 1. 物理层准备
+        print(f"\n--- Fig 6: RMSE vs IBO (v19.0 SNR={SNR_CONFIG['fig6']} dB) ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_signal = phy.generate_broadband_chirp(self.t_axis, 32)
         sig_truth = 1.0 - d_signal
-        # 计算噪声 (基于极低的 -22dB SNR)
         noise_std = self._calc_noise_std(target_snr_db=SNR_CONFIG["fig6"], signal_reference=d_signal)
 
-        # 2. 检测器准备 (预计算模板)
-        v_scan = np.linspace(15000 - 1500, 15000 + 1500, 31)  # 扫描范围 +/- 1500 m/s
+        v_scan = np.linspace(15000 - 1500, 15000 + 1500, 31)
         det_cfg = {'cutoff_freq': 300.0, 'L_eff': GLOBAL_CONFIG['L_eff'], 'a': GLOBAL_CONFIG['a_default'], 'N_sub': 32}
 
         det_main = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
         P_perp = det_main.P_perp
-
-        print("   [Pre-calc] Generating Template Bank...")
         s_raw_list = Parallel(n_jobs=self.n_jobs)(delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan)
         T_bank = np.array([P_perp @ s for s in s_raw_list])
         E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
 
-        # 3. 蒙特卡洛参数
-        # [Strategy] 使用从中到高的 Jitter，配合变化的 IBO。
-        # 低 IBO (0dB) -> 强非线性 -> Jitter 被放大 -> RMSE 升高 (右侧上升)
-        # 高 IBO (30dB) -> 弱信号 -> SNR 极低 (-22dB) -> RMSE 升高 (左侧上升) -> 形成 U 型
+        # v19.0 Levels
         jit_levels = [1.0e-4, 5.0e-4, 2.0e-3]
         ibo_scan = np.linspace(30, 0, 13)
-        trials = 200  # 增加次数以获得平滑曲线
+        trials = 100
 
         fig, ax = plt.subplots(figsize=(5, 4))
         data = {'ibo': ibo_scan}
 
-        # --- Ideal Baseline ---
-        print("   [Sim] Running Ideal Baseline...")
         res_id = Parallel(n_jobs=self.n_jobs)(
             delayed(_trial_rmse_opt)(10.0, 0, s, noise_std, sig_truth, self.N, self.fs, 15000, HW_CONFIG, T_bank,
                                      E_bank, v_scan, ideal=True, P_perp=P_perp)
-            for s in range(trials)
+            for s in tqdm(range(trials), desc="Ideal")
         )
         rmse_id = np.sqrt(np.mean(np.array(res_id) ** 2))
-        ax.semilogy(ibo_scan, [max(rmse_id, 0.1)] * len(ibo_scan), 'k--', label='Ideal (Thermal Limit)')
+        ax.semilogy(ibo_scan, [max(rmse_id, 0.1)] * len(ibo_scan), 'k--', label='Ideal')
         data['ideal'] = [rmse_id] * len(ibo_scan)
 
-        # --- Hardware Curves ---
         for idx, jit in enumerate(jit_levels):
-            print(f"   [Sim] Running Jitter = {jit:.1e} ...")
             res = Parallel(n_jobs=self.n_jobs)(
                 delayed(_trial_rmse_opt)(ibo, jit, s, noise_std, sig_truth, self.N, self.fs, 15000, HW_CONFIG, T_bank,
                                          E_bank, v_scan, ideal=False, P_perp=P_perp)
-                for ibo in tqdm(ibo_scan, leave=False) for s in range(trials)
+                for ibo in tqdm(ibo_scan, desc=f"Jit={jit:.0e}", leave=False) for s in range(trials)
             )
             res_mat = np.array(res).reshape(len(ibo_scan), trials)
-
             rmse = []
             for row in res_mat:
-                # 剔除极端野值 (Gross Error > 1300 m/s) 以计算局部精度，或保留以显示失效
-                # 这里保留野值计算 RMSE，因为我们想看它"飞"起来
-                val = np.sqrt(np.mean(row ** 2))
+                # v19.0 Outlier filtering
+                valid = row[np.abs(row) < 1300]
+                val = np.sqrt(np.mean(valid ** 2)) if len(valid) > 5 else 1000.0
                 rmse.append(val)
 
             ax.semilogy(ibo_scan, rmse, 'o-', label=rf'$\sigma_J$={jit:.0e}')
             data[f'rmse_jit_{idx}'] = rmse
 
-        ax.set_xlabel('Input Back-off (dB)')
+        ax.set_xlabel('IBO (dB)')
         ax.set_ylabel('Velocity RMSE (m/s)')
-        ax.invert_xaxis()  # IBO 大在左边 (线性区)，小在右边 (饱和区)
-        ax.legend(frameon=False, loc='upper center')
-        ax.set_ylim(1, 2000)  # 限制 Y 轴范围以便观察
-        plt.title(f'Robustness vs Nonlinearity (SNR={SNR_CONFIG["fig6"]}dB)')
+        ax.invert_xaxis()
+        ax.legend(frameon=False)
+        self.save_csv(data, 'Fig6_Sensitivity')
         self.save_plot('Fig6_Sensitivity')
-        self.save_csv(data, 'Fig6_Data')
 
     def generate_fig7_roc(self):
-        print(f"\n--- Generating Fig 7: ROC Curves (SNR={SNR_CONFIG['fig7']} dB) ---")
-        trials = 500
+        print(f"\n--- Fig 7: ROC (v19.0 SNR={SNR_CONFIG['fig7']} dB) ---")
+        trials = 200
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_wb = phy.generate_broadband_chirp(self.t_axis, 32)
         noise_std = self._calc_noise_std(SNR_CONFIG["fig7"], d_wb)
@@ -308,8 +357,6 @@ class PaperFigureGenerator:
 
         sig_h1_clean = 1.0 - d_wb
         sig_h0_clean = np.ones(self.N, dtype=complex)
-
-        # 适中的 Jitter，足以在 Hardware 模式下拉低性能
         roc_jitter = 5.0e-4
 
         def run_roc(ideal):
@@ -321,108 +368,76 @@ class PaperFigureGenerator:
                 for s in seeds)
             return np.array(r0), np.array(r1)
 
-        print("   [Sim] Calculating ROC Stats...")
         r0_hw, r1_hw = run_roc(False)
         r0_id, r1_id = run_roc(True)
 
         def get_curve(n, s):
-            # 动态生成阈值
-            all_vals = np.concatenate([n, s])
-            th = np.linspace(np.min(all_vals), np.max(all_vals), 500)
-            p_fa = np.array([np.mean(n > t) for t in th])
-            p_d = np.array([np.mean(s > t) for t in th])
-            return p_fa, p_d
+            th = np.linspace(min(n.min(), s.min()), max(n.max(), s.max()), 200)
+            return np.array([np.mean(n > t) for t in th]), np.array([np.mean(s > t) for t in th])
 
         pf_hw, pd_hw = get_curve(r0_hw[:, 0], r1_hw[:, 0])
-        pf_id, pd_id = get_curve(r0_id[:, 0], r1_id[:, 0])  # GLRT Ideal
-        pf_ed, pd_ed = get_curve(r0_hw[:, 1], r1_hw[:, 1])  # Energy Detector (Baseline)
+        pf_id, pd_id = get_curve(r0_id[:, 0], r1_id[:, 0])
+        pf_ed, pd_ed = get_curve(r0_hw[:, 1], r1_hw[:, 1])
+
+        self.save_csv({'pf_hw': pf_hw, 'pd_hw': pd_hw, 'pf_id': pf_id, 'pd_id': pd_id, 'pf_ed': pf_ed, 'pd_ed': pd_ed},
+                      'Fig7_ROC_Data')
 
         plt.figure(figsize=(5, 5))
         plt.plot(pf_id, pd_id, 'g-', label='Ideal GLRT')
-        plt.plot(pf_hw, pd_hw, 'b-s', markevery=0.1, label='Hardware GLRT')
-        plt.plot(pf_ed, pd_ed, 'r:', label='Energy Detector')
+        plt.plot(pf_hw, pd_hw, 'b-', label='HW GLRT')
+        plt.plot(pf_ed, pd_ed, 'r:', label='Energy Det')
         plt.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-        plt.xlabel('Probability of False Alarm ($P_{FA}$)')
-        plt.ylabel('Probability of Detection ($P_D$)')
-        plt.legend(loc='lower right')
-        plt.title('Detector ROC Performance')
-        plt.grid(True)
+        plt.xlabel('PFA')
+        plt.ylabel('PD')
+        plt.legend()
         self.save_plot('Fig7_ROC')
-        self.save_csv({'pf_hw': pf_hw, 'pd_hw': pd_hw, 'pf_id': pf_id, 'pd_id': pd_id}, 'Fig7_Data')
 
     def generate_fig8_mds(self):
-        print(f"\n--- Generating Fig 8: MDS (Ref SNR={SNR_CONFIG['fig8']} dB) ---")
-        diams = np.array([2, 5, 10, 20, 50])  # mm
-        radii = diams / 2000.0  # m (radius)
-
-        # [CRITICAL] 噪声基底必须固定！
-        # 我们使用默认尺寸 (5cm, a=0.05) 作为 SNR 的参考基准。
-        # 这样，当尺寸变小 (a=0.001) 时，信号减弱，而噪声不变，SNR 剧烈下降。
+        print(f"\n--- Fig 8: MDS (v19.0 Ref SNR={SNR_CONFIG['fig8']} dB) ---")
+        diams = np.array([2, 5, 10, 20, 50])
+        radii = diams / 2000.0
         d_ref = DiffractionChannel({**GLOBAL_CONFIG, 'a': 0.05}).generate_broadband_chirp(self.t_axis, 32)
         noise_std = self._calc_noise_std(SNR_CONFIG["fig8"], d_ref)
 
         det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32)
         P_perp = det.P_perp
         s_norm = P_perp @ det._generate_template(15000)
-        s_norm /= np.linalg.norm(s_norm)  # 归一化模板
+        s_norm /= (np.linalg.norm(s_norm) + 1e-20)
 
-        # 1. 确定 CFAR 阈值 (P_fa = 0.01)
-        print("   [Sim] Calibrating CFAR Threshold...")
         h0_runs = Parallel(n_jobs=self.n_jobs)(
-            delayed(_trial_mds)(False, None, s, noise_std, s_norm, P_perp, self.N, self.fs, True)
-            for s in range(500)
-        )
-        threshold = np.percentile(h0_runs, 99.0)  # 1% False Alarm
+            delayed(_trial_mds)(False, None, s, noise_std, s_norm, P_perp, self.N, self.fs, True) for s in range(200))
+        th = np.percentile(h0_runs, 90.0)
 
         pd_hw, pd_id = [], []
-        mds_jitter = 2.0e-4
+        mds_jitter = 1.0e-4
 
-        print("   [Sim] Scanning Debris Sizes...")
         for a in tqdm(radii):
             phy = DiffractionChannel({**GLOBAL_CONFIG, 'a': a})
             sig = 1.0 - phy.generate_broadband_chirp(self.t_axis, 32)
-
-            # Hardware Runs
             r_hw = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_mds)(True, sig, s, noise_std, s_norm, P_perp, self.N, self.fs, False, mds_jitter)
-                for s in range(200))
-
-            # Ideal Runs
+                delayed(_trial_mds)(True, sig, s, noise_std, s_norm, P_perp, self.N, self.fs, False, mds_jitter) for s
+                in range(100))
             r_id = Parallel(n_jobs=self.n_jobs)(
-                delayed(_trial_mds)(True, sig, s, noise_std, s_norm, P_perp, self.N, self.fs, True, 0)
-                for s in range(200))
+                delayed(_trial_mds)(True, sig, s, noise_std, s_norm, P_perp, self.N, self.fs, True, 0) for s in
+                range(100))
+            pd_hw.append(np.mean(np.array(r_hw) > th))
+            pd_id.append(np.mean(np.array(r_id) > th))
 
-            pd_hw.append(np.mean(np.array(r_hw) > threshold))
-            pd_id.append(np.mean(np.array(r_id) > threshold))
+        self.save_csv({'d': diams, 'pd_hw': pd_hw, 'pd_id': pd_id}, 'Fig8_MDS_Data')
 
         plt.figure(figsize=(5, 4))
         plt.semilogx(diams, pd_id, 'g--o', label='Ideal')
-        plt.semilogx(diams, pd_hw, 'b-s', label='Hardware-Impaired')
-        plt.axhline(0.5, color='k', ls=':', label='Detection Limit')
-        plt.xlabel('Debris Diameter (mm)')
-        plt.ylabel('Detection Probability')
+        plt.semilogx(diams, pd_hw, 'b-s', label='Hardware')
+        plt.axhline(0.5, color='k', ls=':')
         plt.legend()
-        plt.title(f'Minimum Detectable Size (MDS)')
         self.save_plot('Fig8_MDS')
-        self.save_csv({'d': diams, 'pd_hw': pd_hw, 'pd_id': pd_id}, 'Fig8_Data')
 
     def generate_fig9_isac(self):
-        print(f"\n--- Generating Fig 9: ISAC Trade-off (SNR={SNR_CONFIG['fig9']} dB) ---")
+        print(f"\n--- Fig 9: ISAC (v19.0 SNR={SNR_CONFIG['fig9']} dB) ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
-        # ISAC 通信看的是底下的"载波"，而不是衍射图案
-        # 信号 = 1.0 (Carrier) - d(t)。通信解调的是 Carrier 的相位/幅度。
         sig_truth = 1.0 - phy.generate_broadband_chirp(self.t_axis, 32)
+        noise_std = self._calc_noise_std(SNR_CONFIG["fig9"], 1.0 - sig_truth)
 
-        # 这里的 SNR 参考的是 Carrier (1.0) 的功率，还是衍射信号？
-        # 通信 SNR 通常指 Carrier-to-Noise。
-        # 如果我们用 _calc_noise_std(d_ref)，那是针对 Sensing 的。
-        # 这里为了简单，我们还是用 Sensing 的 Noise Level，但是因为 SNR 设得高 (-5dB relative to d)，
-        # 所以 Carrier SNR 会极其巨大 (Carrier power >> d power)。
-        # 为了让通信看起来不那么完美，我们需要加上显著的相位噪声影响。
-
-        noise_std = self._calc_noise_std(SNR_CONFIG["fig9"], 1.0 - sig_truth)  # Ref is 1.0 (Approx)
-
-        # Sensing 准备
         v_scan = np.linspace(14000, 16000, 41)
         det_cfg = {'cutoff_freq': 300.0, 'L_eff': 50e3, 'N_sub': 32, 'a': 0.05}
         det = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
@@ -435,12 +450,11 @@ class PaperFigureGenerator:
         cap, rmse = [], []
         isac_jitter = 1.0e-4
 
-        print("   [Sim] Running ISAC Trade-off...")
         for ibo in tqdm(ibo_scan):
             res = Parallel(n_jobs=self.n_jobs)(
                 delayed(_trial_isac)(ibo, s, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp, self.N, self.fs,
                                      False, isac_jitter)
-                for s in range(50)
+                for s in range(40)
             )
             res = np.array(res)
             cap.append(np.mean(res[:, 0]))
@@ -449,70 +463,17 @@ class PaperFigureGenerator:
             valid = errs[errs < 1200]
             rmse.append(np.sqrt(np.mean(valid ** 2)) if len(valid) > 5 else 1000.0)
 
+        self.save_csv({'ibo': ibo_scan, 'cap': cap, 'rmse': rmse}, 'Fig9_ISAC_Data')
+
         plt.figure(figsize=(6, 5))
         sc = plt.scatter(cap, rmse, c=ibo_scan, cmap='viridis_r', s=80, edgecolors='k')
-        cbar = plt.colorbar(sc)
-        cbar.set_label('IBO (dB)')
-        plt.xlabel('Comm Capacity (bits/s/Hz)')
-        plt.ylabel('Sensing RMSE (m/s)')
-        plt.title('ISAC Performance Trade-off')
-        plt.grid(True)
+        plt.colorbar(sc, label='IBO (dB)')
+        plt.xlabel('Capacity')
+        plt.ylabel('RMSE')
         self.save_plot('Fig9_ISAC')
-        self.save_csv({'ibo': ibo_scan, 'cap': cap, 'rmse': rmse}, 'Fig9_Data')
-
-    def generate_fig10_ambiguity(self):
-        print("\n--- Generating Fig 10: Ambiguity Function ---")
-        det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32)
-        s0 = det.P_perp @ det._generate_template(15000)
-        v_shifts = np.linspace(-500, 500, 41)
-        t_shifts = np.linspace(-0.002, 0.002, 41)
-        res = np.zeros((41, 41))
-        E = np.sum(s0 ** 2)
-
-        # 简单的双重循环，不用并行
-        for i, dv in enumerate(v_shifts):
-            s_v = det.P_perp @ det._generate_template(15000 + dv)
-            for j, dt in enumerate(t_shifts):
-                shift = int(dt * self.fs)
-                s_shift = np.roll(s_v, shift)
-                # Zero padding for valid linear convolution simulation
-                if shift > 0:
-                    s_shift[:shift] = 0
-                else:
-                    s_shift[shift:] = 0
-                res[i, j] = (np.dot(s0, s_shift) ** 2) / E
-
-        plt.figure(figsize=(5, 4))
-        plt.contourf(t_shifts * 1000, v_shifts, res / np.max(res), 20, cmap='viridis')
-        plt.xlabel('Time Delay (ms)')
-        plt.ylabel('Velocity Mismatch (m/s)')
-        plt.title('Ambiguity Function')
-        plt.colorbar(label='Normalized Correlation')
-        self.save_plot('Fig10_Ambiguity')
-
-    def generate_fig11_trajectory(self):
-        print("\n--- Generating Fig 11: Signal Trajectory ---")
-        phy = DiffractionChannel(GLOBAL_CONFIG)
-        d = phy.generate_broadband_chirp(self.t_axis, 32)
-        hw = HardwareImpairments(HW_CONFIG)
-
-        # 制造一个极度嘈杂的轨迹云
-        jit = hw.generate_colored_jitter(self.N, self.fs)
-        pn = hw.generate_phase_noise(self.N, self.fs)
-
-        noise_cloud = (1.0 - d) * np.exp(jit * 10) * np.exp(1j * pn)
-        noise_cloud -= np.mean(noise_cloud)  # Center at 0
-
-        plt.figure(figsize=(5, 5))
-        plt.plot(np.real(noise_cloud), np.imag(noise_cloud), '.', color='grey', alpha=0.1, label='Samples')
-        plt.xlabel('I Component')
-        plt.ylabel('Q Component')
-        plt.title('Signal Trajectory (Constellation)')
-        plt.grid(True)
-        self.save_plot('Fig11_Trajectory')
 
     def run_all(self):
-        print("=== SIMULATION START (V20.0 ULTIMATE STRESS TEST) ===")
+        print("=== SIMULATION START (V19.0 ROBUST REVERT) ===")
         # Group A
         self.generate_fig2_mechanisms()
         self.generate_fig3_dispersion()
@@ -520,16 +481,16 @@ class PaperFigureGenerator:
         self.generate_fig5_survival_space()
         self.generate_fig10_ambiguity()
         self.generate_fig11_trajectory()
-        # Group B (Heavy)
+        # Group B
         self.generate_fig6_rmse_sensitivity()
         self.generate_fig7_roc()
         self.generate_fig8_mds()
         self.generate_fig9_isac()
-        print("\n=== ALL TASKS DONE. CHECK OUTPUT FOLDER. ===")
+        print("\n=== ALL TASKS DONE ===")
 
 
 # =========================================================================
-# Worker Functions (Picklable for Multiprocessing)
+# Worker Functions (With Safety Patch)
 # =========================================================================
 
 def _log_envelope(y):
@@ -537,7 +498,6 @@ def _log_envelope(y):
 
 
 def _gen_template(v, fs, N, cfg):
-    # Helper to instantiate detector inside worker
     return TerahertzDebrisDetector(fs, N, **cfg)._generate_template(v)
 
 
@@ -554,17 +514,12 @@ def _trial_rmse_opt(ibo, jitter_rms, seed, noise_std, sig_truth, N, fs, true_v, 
         pn = np.exp(1j * hw.generate_phase_noise(N, fs))
         pa_out, _, _ = hw.apply_saleh_pa(sig_truth * jit * pn, ibo_dB=ibo)
 
-    # Add Thermal Noise
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-
-    # Detector Chain
     z = _log_envelope(pa_out + w)
-    z_perp = P_perp @ z  # Projection
+    z_perp = P_perp @ z
 
-    # Match Filter Bank
-    stats = (np.dot(T_bank, z_perp) ** 2) / E_bank
-
-    # Estimator
+    # Safety patch: E_bank + eps
+    stats = (np.dot(T_bank, z_perp) ** 2) / (E_bank + 1e-20)
     v_hat = v_scan[np.argmax(stats)]
     return v_hat - true_v
 
@@ -585,25 +540,18 @@ def _trial_roc_fast(sig_clean, seed, noise_std, ideal, s_true_perp, s_energy, P_
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     z_perp = P_perp @ _log_envelope(pa_out + w)
 
-    # GLRT Statistic
-    stat_glrt = (np.dot(s_true_perp, z_perp) ** 2) / s_energy
-
-    # Energy Detector Statistic (Benchmark)
-    # AC Energy of envelope
+    stat_glrt = (np.dot(s_true_perp, z_perp) ** 2) / (s_energy + 1e-20)
     y_ac = np.abs(pa_out + w) - np.mean(np.abs(pa_out + w))
     stat_ed = np.sum(y_ac ** 2)
-
     return stat_glrt, stat_ed
 
 
 def _trial_mds(is_h1, sig_clean, seed, noise_std, s_norm, P_perp, N, fs, ideal, jitter_val=0):
     np.random.seed(seed)
-
-    # H0 (Noise Only) or H1 (Signal + Noise)
     if is_h1:
         sig = sig_clean
     else:
-        sig = np.ones(N, dtype=complex)  # Just Carrier
+        sig = np.ones(N, dtype=complex)
 
     if ideal:
         pa_out = sig
@@ -611,12 +559,10 @@ def _trial_mds(is_h1, sig_clean, seed, noise_std, s_norm, P_perp, N, fs, ideal, 
         hw = HardwareImpairments(HW_CONFIG)
         hw.jitter_rms = jitter_val
         jit = np.exp(hw.generate_colored_jitter(N, fs))
-        pa_out, _, _ = hw.apply_saleh_pa(sig * jit, ibo_dB=10.0)  # Fixed IBO
+        pa_out, _, _ = hw.apply_saleh_pa(sig * jit, ibo_dB=10.0)
 
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     z = _log_envelope(pa_out + w)
-
-    # Normalized Statistic
     stat = (np.dot(s_norm, P_perp @ z) ** 2)
     return stat
 
@@ -631,23 +577,17 @@ def _trial_isac(ibo, seed, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp,
     else:
         hw.jitter_rms = jitter_val
         jit = np.exp(hw.generate_colored_jitter(N, fs))
-        # 通信受到 PA 非线性扭曲的影响 (EVM)
         pa_out, _, _ = hw.apply_saleh_pa(sig_truth * jit, ibo_dB=ibo)
-        # 简单的失真模型: 失真功率随 IBO 降低而增加
         gamma_eff = 1e-2 * (10 ** (-ibo / 10.0))
 
-    # Comm Capacity Calculation
     p_rx = np.mean(np.abs(pa_out) ** 2)
-    # SINR = Signal / (ThermalNoise + NonLinearDistortion)
     sinr = p_rx / (noise_std ** 2 + p_rx * gamma_eff + 1e-20)
     cap = np.log2(1 + sinr)
 
-    # Sensing Calculation
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     z = _log_envelope(pa_out + w)
-    stats = (np.dot(T_bank, P_perp @ z) ** 2) / E_bank
+    stats = (np.dot(T_bank, P_perp @ z) ** 2) / (E_bank + 1e-20)
     v_est = v_scan[np.argmax(stats)]
-
     return cap, abs(v_est - GLOBAL_CONFIG['v_default'])
 
 

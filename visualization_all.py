@@ -199,7 +199,6 @@ class PaperFigureGenerator:
         plt.xlabel('Normalized Time')
         plt.ylabel('Amplitude')
         self.save_plot('Fig4_Self_Healing')
-        self.save_plot('Fig4_Self_Healing')
 
     def generate_fig5_survival_space(self):
         print("\n--- Fig 5: Spectrogram ---")

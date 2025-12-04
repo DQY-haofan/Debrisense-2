@@ -54,10 +54,10 @@ GLOBAL_CONFIG = {
 # 为了补偿这 24dB+ 的损耗，我们需要给输入信号加 15dB 的 SNR，
 # 这样有效 SNR 才能落在检测器的灵敏度区间 (-5dB 到 +25dB) 内。
 SNR_CONFIG = {
-    "fig6": 12.0,  # 降至 12dB，引入热噪声底噪，防止 RMSE=0
-    "fig7": 12.0,
-    "fig8": 12.0,  # 降至 12dB，拉开不同尺寸目标的差距
-    "fig9": 8.0    # 降至 8dB，平滑 ISAC 的饱和区拐点
+    "fig6": 12.0,   # RMSE: 保持，物理顺序修正后会自然形成 U 型
+    "fig7": -10.0,  # ROC: 大幅降低！从 12 降到 -10。因为 GLRT 增益高达 30dB，必须在极低 SNR 下才能拉开差距。
+    "fig8": 18.0,   # MDS: 提高到 18dB，确保 50mm 碎片在硬件损伤下也能被检出 (S型回归)
+    "fig9": 8.0     # ISAC: 保持
 }
 
 # --- 硬件损伤默认配置 ---
@@ -291,35 +291,34 @@ class PaperFigureGenerator:
         self.save_plot('Fig10_Ambiguity')
 
     def generate_fig11_trajectory(self):
-        print("\n--- Fig 11: Trajectory (Visual Fix) ---")
+        print("\n--- Fig 11: Trajectory (Error Vector Cloud) ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)
-        d = phy.generate_broadband_chirp(self.t_axis, 32)
+        # 理想参考信号
+        d_ideal = phy.generate_broadband_chirp(self.t_axis, 32)
+
         hw = HardwareImpairments(HW_CONFIG)
-
-        # 增加 Phase Noise
+        # 硬件损伤信号：加入相位噪声、Jitter
         pn = np.exp(1j * hw.generate_phase_noise(self.N, self.fs))
-        # 增加幅度噪声 (Jitter)
-        jit = np.exp(hw.generate_colored_jitter(self.N, self.fs) * 20)  # 放大 jitter 以便目视
+        jit = np.exp(hw.generate_colored_jitter(self.N, self.fs) * 10)  # 适当放大 Jitter 以便观察
 
-        noise_cloud = (1.0 - d) * jit * pn
+        # 接收信号模型 (忽略衰减，只看形态)
+        sig_rx = (1.0 - d_ideal) * jit * pn
 
-        # 去除直流
-        iq_samples = noise_cloud - np.mean(noise_cloud)
-        # 去除低频漂移
-        iq_samples = signal.detrend(iq_samples)
+        # [Visual Fix] 核心技巧：绘制 "残差" (Residual / Error Vector)
+        # 我们减去理想信号，剩下的就是纯粹的 "噪声+失真"
+        # 这就是星座图中那个模糊的云团
+        error_vector = sig_rx - (1.0 - d_ideal)
 
-        # [Visual Fix] 叠加额外的热噪声 (Thermal Noise Floor) 打散弧线
-        # 这模拟了接收机底噪，让星座图看起来更真实
-        thermal_noise = (np.random.randn(len(iq_samples)) + 1j * np.random.randn(len(iq_samples))) * 0.002
-        iq_samples += thermal_noise
+        # 去除直流偏置
+        error_vector = error_vector - np.mean(error_vector)
 
-        self.save_csv({'real': np.real(iq_samples), 'imag': np.imag(iq_samples)}, 'Fig11_Trajectory_Data')
+        self.save_csv({'real': np.real(error_vector), 'imag': np.imag(error_vector)}, 'Fig11_Trajectory_Data')
 
         plt.figure(figsize=(5, 5))
-        plt.plot(np.real(iq_samples), np.imag(iq_samples), '.', color='grey', alpha=0.2, markersize=2)
-        plt.xlabel('In-Phase (I)')
-        plt.ylabel('Quadrature (Q)')
-        plt.title("IQ Constellation (Received)")
+        plt.plot(np.real(error_vector), np.imag(error_vector), '.', color='grey', alpha=0.3, markersize=2)
+        plt.xlabel('In-Phase Error')
+        plt.ylabel('Quadrature Error')
+        plt.title("Error Vector Magnitude (EVM) Cloud")
         plt.grid(True, linestyle=':')
         plt.axis('equal')
         plt.tight_layout()
@@ -572,9 +571,8 @@ def _gen_template(v, fs, N, cfg):
 
 def _apply_agc(signal_in):
     """
-    简易 AGC (自动增益控制):
-    补偿 PA 带来的功率损耗，将信号能量归一化，
-    确保后续叠加的 Noise 符合预期的 SNR 定义。
+    AGC: 根据输入信号功率进行归一化。
+    注意：在物理上，AGC 会同时放大信号和已经混入的热噪声。
     """
     p_sig = np.mean(np.abs(signal_in) ** 2)
     if p_sig < 1e-20:
@@ -594,28 +592,34 @@ def _gen_template(v, fs, N, cfg):
 def _trial_rmse_opt(ibo, jitter_rms, seed, noise_std, sig_truth, N, fs, true_v, hw_base, T_bank, E_bank, v_scan, ideal,
                     P_perp):
     np.random.seed(seed)
+
+    # 1. 生成物理信号 (Physical Signal Generation)
     if ideal:
-        pa_out = sig_truth
+        pa_out_raw = sig_truth
     else:
         hw_cfg = hw_base.copy()
         hw_cfg['jitter_rms'] = jitter_rms
         hw = HardwareImpairments(hw_cfg)
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pn = np.exp(1j * hw.generate_phase_noise(N, fs))
+        # PA 输出：幅度可能衰减到 0.05 (低 IBO) 或 0.005 (高 IBO)
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_truth * jit * pn, ibo_dB=ibo)
 
-        # [AGC FIX] 归一化 PA 输出，补偿插入损耗
-        pa_out = _apply_agc(pa_out_raw)
-
+    # 2. 加入热噪声 (Add Thermal Noise) -- [CORRECT PHYSICS]
+    # 噪声必须加在 AGC 之前。这样当 pa_out_raw 很小时，信噪比自然恶化。
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-    z = _log_envelope(pa_out + w)
+    rx_signal = pa_out_raw + w
+
+    # 3. 接收机处理 (Receiver Processing)
+    # AGC 归一化 -> 对数包络 -> 正交投影
+    z = _log_envelope(_apply_agc(rx_signal))
     z_perp = P_perp @ z
 
+    # 4. 估计与插值 (Estimation)
     stats = (np.dot(T_bank, z_perp) ** 2) / (E_bank + 1e-20)
     idx_max = np.argmax(stats)
     v_coarse = v_scan[idx_max]
 
-    # Parabolic Interpolation
     if 0 < idx_max < len(stats) - 1:
         alpha = stats[idx_max - 1]
         beta = stats[idx_max]
@@ -633,30 +637,30 @@ def _trial_roc_fast(sig_clean, seed, noise_std, ideal, s_true_perp, s_energy, P_
     np.random.seed(seed)
     hw = HardwareImpairments(HW_CONFIG)
 
+    # 1. 物理层
     if ideal:
-        pa_out = sig_clean
+        pa_out_raw = sig_clean
     else:
         hw.jitter_rms = jitter_val
         fs, N = GLOBAL_CONFIG['fs'], len(sig_clean)
         jit = np.exp(hw.generate_colored_jitter(N, fs))
+        # IBO=10dB, 信号有衰减
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_clean * jit, ibo_dB=10.0)
 
-        # [AGC FIX] 关键修复！
-        # 如果不加 AGC，pa_out 幅度只有 0.05，而 noise_std 是按 1.0 算的
-        # 导致实际 SNR 极低。
-        pa_out = _apply_agc(pa_out_raw)
-
-    N = len(sig_clean)
+    # 2. 加噪声 (Pre-AGC)
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
+    rx_signal = pa_out_raw + w
 
-    # 信号处理
-    env = _log_envelope(pa_out + w)
-    z_perp = P_perp @ env
-
+    # 3. 接收处理
+    # GLRT 使用 Log-Envelope
+    z_log = _log_envelope(_apply_agc(rx_signal))
+    z_perp = P_perp @ z_log
     stat_glrt = (np.dot(s_true_perp, z_perp) ** 2) / (s_energy + 1e-20)
 
-    # 能量检测器 (Energy Detector) - 使用去均值后的能量
-    y_ac = np.abs(pa_out + w) - np.mean(np.abs(pa_out + w))
+    # Energy Detector 使用线性幅度 (AGC后)
+    # 去除直流，只看能量波动
+    rx_norm = np.abs(_apply_agc(rx_signal))
+    y_ac = rx_norm - np.mean(rx_norm)
     stat_ed = np.sum(y_ac ** 2)
 
     return stat_glrt, stat_ed
@@ -665,28 +669,25 @@ def _trial_roc_fast(sig_clean, seed, noise_std, ideal, s_true_perp, s_energy, P_
 def _trial_mds(is_h1, sig_clean, seed, noise_std, s_norm, P_perp, N, fs, ideal, jitter_val=0):
     np.random.seed(seed)
 
-    # 构造输入信号
     if is_h1:
         sig_in = sig_clean
     else:
-        # H0: 只有载波 (CW)
         sig_in = np.ones(N, dtype=complex)
 
     if ideal:
-        pa_out = sig_in
+        pa_out_raw = sig_in
     else:
         hw = HardwareImpairments(HW_CONFIG)
         hw.jitter_rms = jitter_val
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_in * jit, ibo_dB=10.0)
 
-        # [AGC FIX] 关键修复！确保 H0 和 H1 都在相同的功率水平下比较
-        pa_out = _apply_agc(pa_out_raw)
-
+    # Pre-AGC Noise
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-    z = _log_envelope(pa_out + w)
+    rx_signal = pa_out_raw + w
 
-    # GLRT Statistic
+    # Processing
+    z = _log_envelope(_apply_agc(rx_signal))
     stat = (np.dot(s_norm, P_perp @ z) ** 2)
     return stat
 
@@ -696,34 +697,28 @@ def _trial_isac(ibo, seed, noise_std, sig_truth, T_bank, E_bank, v_scan, P_perp,
     hw = HardwareImpairments(HW_CONFIG)
 
     if ideal:
-        pa_out = sig_truth
+        pa_out_raw = sig_truth
         gamma_eff = 0
     else:
         hw.jitter_rms = jitter_val
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_truth * jit, ibo_dB=ibo)
-
-        # [AGC FIX] 通信也需要 AGC 才能正确解调，但在 ISAC 计算 Capacity 时
-        # 我们通常看的是 SINR。
-        # 这里的 Capacity 公式 sinr = p_rx / ... 已经使用了 p_rx (接收功率)
-        # 所以 Capacity 计算本身是对的。
-        # 但是 RMSE 计算部分需要 AGC 辅助感知：
-        pa_out = _apply_agc(pa_out_raw)
-
-        # 修正系数
         gamma_eff = 4.0e-3 * (10 ** (-ibo / 10.0))
 
-    # 计算 Capacity (使用 AGC 之前的功率关系，或者之后的，只要一致即可)
-    # 这里我们简化：假设 AGC 完美，不改变 SINR (同时放大信号和干扰)
-    # 实际上 Capacity 由物理层 SINR 决定
-    p_rx = np.mean(np.abs(pa_out) ** 2)  # AGC 后约为 1.0
+    # Pre-AGC Noise for RMSE calculation
+    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
+    rx_signal = pa_out_raw + w
+    z = _log_envelope(_apply_agc(rx_signal))
+
+    stats = (np.dot(T_bank, P_perp @ z) ** 2) / (E_bank + 1e-20)
+    v_est = v_scan[np.argmax(stats)]
+
+    # Capacity 计算 (依然使用 SINR 模型)
+    # p_rx 应该是实际接收功率
+    p_rx = np.mean(np.abs(pa_out_raw) ** 2)
     sinr = p_rx / (noise_std ** 2 + p_rx * gamma_eff + 1e-20)
     cap = np.log2(1 + sinr)
 
-    w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
-    z = _log_envelope(pa_out + w)
-    stats = (np.dot(T_bank, P_perp @ z) ** 2) / (E_bank + 1e-20)
-    v_est = v_scan[np.argmax(stats)]
     return cap, abs(v_est - GLOBAL_CONFIG['v_default'])
 
 

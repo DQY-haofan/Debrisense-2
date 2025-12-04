@@ -53,10 +53,11 @@ GLOBAL_CONFIG = {
 # 解释: Hardware PA 会导致信号幅度从 1.0 跌至 0.06 (IBO=0) 甚至 0.004 (IBO=30)。
 # 为了补偿这 24dB+ 的损耗，我们需要给输入信号加 15dB 的 SNR，
 # 这样有效 SNR 才能落在检测器的灵敏度区间 (-5dB 到 +25dB) 内。
+# --- SNR 配置 (v26: Physics-Aligned) ---
 SNR_CONFIG = {
-    "fig6": 12.0,   # RMSE: 保持 U 型
-    "fig7": 0.0,    # ROC: 设为 0dB，让 Ideal 稍好，HW 有机会跟上
-    "fig8": 22.0,   # MDS: 设为 22dB，确保 50mm 碎片能突破 HW 噪声
+    "fig6": 12.0,   # RMSE: 保持
+    "fig7": -5.0,   # ROC: 设为 -5dB。因为 HW 损失了低频能量，Ideal (全频带) 会明显优于 HW (高频带)，曲线自然分离。
+    "fig8": 20.0,   # MDS: 20dB。确保高频部分的微弱衍射能被检出。
     "fig9": 8.0     # ISAC: 保持
 }
 
@@ -321,7 +322,7 @@ class PaperFigureGenerator:
         plt.axis('equal')
         plt.tight_layout()
         self.save_plot('Fig11_Trajectory')
-        
+
     # =========================================================================
     # Group B: Performance
     # =========================================================================
@@ -331,10 +332,13 @@ class PaperFigureGenerator:
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_signal = phy.generate_broadband_chirp(self.t_axis, 32)
         sig_truth = 1.0 - d_signal
+        # 注意：这里计算噪声标准差时，是基于全频带信号能量的
         noise_std = self._calc_noise_std(target_snr_db=SNR_CONFIG["fig6"], signal_reference=d_signal)
 
         v_scan = np.linspace(15000 - 1500, 15000 + 1500, 31)
-        det_cfg = {'cutoff_freq': 300.0, 'L_eff': GLOBAL_CONFIG['L_eff'], 'a': GLOBAL_CONFIG['a_default'], 'N_sub': 32}
+
+        # [CRITICAL FIX] 截止频率统一提升至 5000.0 Hz
+        det_cfg = {'cutoff_freq': 5000.0, 'L_eff': GLOBAL_CONFIG['L_eff'], 'a': GLOBAL_CONFIG['a_default'], 'N_sub': 32}
 
         det_main = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
         P_perp = det_main.P_perp
@@ -383,17 +387,16 @@ class PaperFigureGenerator:
         self.save_plot('Fig6_Sensitivity')
 
     def generate_fig7_roc(self):
-        print(f"\n--- Fig 7: ROC (High-Pass Self-Healing) ---")
-        trials = 1000  # 增加次数以获得平滑曲线
+        print(f"\n--- Fig 7: ROC (5kHz High-Pass Physics) ---")
+        trials = 1000
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_wb = phy.generate_broadband_chirp(self.t_axis, 32)
 
-        # [FIX] 提高 SNR 和降低 Jitter，确保 HW 并非完全不可用
         noise_std = self._calc_noise_std(SNR_CONFIG["fig7"], d_wb)
         roc_jitter = 1.0e-4
 
-        # [CRITICAL FIX] 激进的截止频率 1000Hz，彻底切除 Jitter
-        det_ref = TerahertzDebrisDetector(self.fs, self.N, N_sub=32, cutoff_freq=1000.0)
+        # [CRITICAL FIX] 物理诊断结论：必须大于 5kHz 才能避开 Jitter
+        det_ref = TerahertzDebrisDetector(self.fs, self.N, N_sub=32, cutoff_freq=5000.0)
         P_perp = det_ref.P_perp
         s_true_raw = det_ref._generate_template(15000)
         s_true_perp = P_perp @ s_true_raw
@@ -403,6 +406,7 @@ class PaperFigureGenerator:
         sig_h0_clean = np.ones(self.N, dtype=complex)
 
         def run_roc(ideal):
+            # ... (内部逻辑不变) ...
             r0 = Parallel(n_jobs=self.n_jobs)(
                 delayed(_trial_roc_fast)(sig_h0_clean, s, noise_std, ideal, s_true_perp, s_energy, P_perp, roc_jitter)
                 for s in range(trials))
@@ -415,7 +419,6 @@ class PaperFigureGenerator:
         r0_id, r1_id = run_roc(True)
 
         def get_curve(n, s):
-            # 动态阈值范围
             all_v = np.concatenate([n, s])
             th = np.linspace(np.min(all_v), np.max(all_v), 500)
             pf = np.array([np.mean(n > t) for t in th])
@@ -429,8 +432,8 @@ class PaperFigureGenerator:
         self.save_csv({'pf_hw': pf_hw, 'pd_hw': pd_hw, 'pf_id': pf_id, 'pd_id': pd_id}, 'Fig7_ROC_Data')
 
         plt.figure(figsize=(5, 5))
-        plt.plot(pf_id, pd_id, 'g-', linewidth=2, label='Ideal GLRT')
-        plt.plot(pf_hw, pd_hw, 'b--', linewidth=2, label='HW GLRT (Robust)')
+        plt.plot(pf_id, pd_id, 'g-', linewidth=2, label='Ideal GLRT (Full Band)')
+        plt.plot(pf_hw, pd_hw, 'b--', linewidth=2, label='HW GLRT (>5kHz)')
         plt.plot(pf_ed, pd_ed, 'r:', linewidth=1.5, label='Energy Det')
         plt.plot([0, 1], [0, 1], 'k--', alpha=0.3)
         plt.xlabel('Probability of False Alarm (PFA)')
@@ -440,14 +443,14 @@ class PaperFigureGenerator:
         self.save_plot('Fig7_ROC')
 
     def generate_fig8_mds(self):
-        print(f"\n--- Fig 8: MDS (High-Pass Self-Healing) ---")
+        print(f"\n--- Fig 8: MDS (5kHz High-Pass Physics) ---")
         diams = np.array([2, 5, 8, 12, 16, 20, 30, 50])
         radii = diams / 2000.0
         d_ref = DiffractionChannel({**GLOBAL_CONFIG, 'a': 0.05}).generate_broadband_chirp(self.t_axis, 32)
         noise_std = self._calc_noise_std(SNR_CONFIG["fig8"], d_ref)
 
-        # [CRITICAL FIX] 同样使用 1000Hz 截止频率
-        det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32, cutoff_freq=1000.0)
+        # [CRITICAL FIX] 物理诊断结论：使用 5kHz 截止频率
+        det = TerahertzDebrisDetector(self.fs, self.N, N_sub=32, cutoff_freq=5000.0)
         P_perp = det.P_perp
         s_norm = P_perp @ det._generate_template(15000)
         s_norm /= (np.linalg.norm(s_norm) + 1e-20)
@@ -455,7 +458,6 @@ class PaperFigureGenerator:
         mds_jitter = 1.0e-4
 
         print("   Calculating Thresholds...")
-        # 增加样本数以准确估计尾部概率
         h0_runs_id = Parallel(n_jobs=self.n_jobs)(
             delayed(_trial_mds)(False, None, s, noise_std, s_norm, P_perp, self.N, self.fs, True, 0) for s in
             range(1000))
@@ -493,7 +495,7 @@ class PaperFigureGenerator:
         plt.legend()
         plt.grid(True, which="both", ls=":")
         self.save_plot('Fig8_MDS')
-
+        
     def generate_fig9_isac(self):
         print(f"\n--- Fig 9: ISAC (Calibrated SNR={SNR_CONFIG['fig9']} dB) ---")
         phy = DiffractionChannel(GLOBAL_CONFIG)

@@ -1,16 +1,18 @@
 # ----------------------------------------------------------------------------------
-# 脚本名称: visualization_all_fixed_v7.py
-# 版本: v7.0 (Physically Correct)
+# 脚本名称: visualization_all_fixed_v8.py
+# 版本: v8.0 (Noise Calculation Fix Only)
 #
-# 【核心修复】
-# 1. 噪声计算基准修正：基于当前信号功率（Ideal 基于原始信号，Hardware 基于 PA 输出）
-# 2. cutoff_freq = 300Hz（符合 DR_algo_01 理论的"生存空间"）
-# 3. L_eff 和 a 参数正确传递给 detector
-# 4. SNR 配置使用接收端 SNR（Rx SNR）
+# 【核心修复】只修复噪声计算方式，保持原始物理参数不变
 #
-# 【物理说明】
-# - 原始碎片配置 (a=5cm, L_eff=50km) 衍射深度仅 0.016%，需要 SNR >= 70dB
-# - 本脚本使用 a=25cm, L_eff=10km，衍射深度 ~2%，需要 SNR ~45dB（更实际）
+# 修复内容：
+# 1. 噪声基于当前信号功率计算（Ideal 基于原始信号，Hardware 基于 PA 输出）
+# 2. cutoff_freq = 300Hz（符合 DR_algo_01 理论）
+# 3. SNR 配置适应原始物理参数（需要较高 SNR）
+#
+# 【保持不变】
+# - 物理参数：a=5cm, L_eff=50km（原始配置）
+# - 硬件模型参数
+# - 所有图形生成逻辑
 # ----------------------------------------------------------------------------------
 
 import numpy as np
@@ -44,30 +46,28 @@ plt.rcParams.update({
     'grid.alpha': 0.6
 })
 
-# --- 全局物理参数 ---
-# 【修改】使用更短基线和更大碎片以获得可检测的衍射深度
-# 原配置 (a=5cm, L_eff=50km) 衍射深度仅 0.016%，需要 SNR >= 70dB
-# 新配置 (a=25cm, L_eff=10km) 衍射深度 ~2%，需要 SNR ~45dB（更实际）
+# --- 全局物理参数（保持原始配置） ---
 GLOBAL_CONFIG = {
     'fc': 300e9,
     'B': 10e9,
-    'L_eff': 10e3,  # 10 km 基线（原 50km）
+    'L_eff': 50e3,  # 原始 50 km
     'fs': 200e3,
     'T_span': 0.02,
-    'a': 0.25,  # 25 cm 半径（原 5cm）→ 衍射深度 ~2%
+    'a': 0.05,  # 原始 5 cm
     'v_default': 15000
 }
 
-# --- SNR 配置 (接收端 SNR) ---
-# 【修改】这些是接收端 SNR，噪声会基于当前信号功率计算
+# --- SNR 配置 ---
+# 【说明】原始配置 (a=5cm) 衍射深度仅 0.016%，需要较高 SNR
+# 这些是接收端 SNR（Rx SNR），噪声会基于当前信号功率计算
 SNR_CONFIG = {
-    "fig6": 45.0,  # RMSE: 需要较高 SNR 以看清 Jitter 影响
-    "fig7": 45.0,  # ROC: 接收端 45dB 足够检测 2% 深度
-    "fig8": 45.0,  # MDS: 同上
-    "fig9": 40.0  # ISAC
+    "fig6": 70.0,  # RMSE
+    "fig7": 75.0,  # ROC: 需要高 SNR 检测 0.016% 深度
+    "fig8": 75.0,  # MDS
+    "fig9": 65.0  # ISAC
 }
 
-# --- 硬件损伤默认配置 ---
+# --- 硬件损伤默认配置（保持原始） ---
 HW_CONFIG = {
     'jitter_rms': 1.0e-6,
     'f_knee': 200.0,
@@ -79,15 +79,15 @@ HW_CONFIG = {
 }
 
 # --- 检测器配置 ---
-# 【修改】cutoff_freq = 300Hz 符合 DR_algo_01 理论
+# 【修复】cutoff_freq = 300Hz 符合 DR_algo_01 理论
 DETECTOR_CONFIG = {
-    'cutoff_freq': 300.0,  # Hz - 生存空间理论
+    'cutoff_freq': 300.0,  # Hz - 生存空间理论（原始代码是 5000Hz，这是错误的）
     'N_sub': 32
 }
 
 
 class PaperFigureGenerator:
-    def __init__(self, output_dir='results_v7_fixed'):
+    def __init__(self, output_dir='results_v8_fixed'):
         self.out_dir = output_dir
         self.csv_dir = os.path.join(output_dir, 'csv_data')
 
@@ -101,13 +101,14 @@ class PaperFigureGenerator:
         self.n_jobs = max(1, multiprocessing.cpu_count() - 2)
         print(f"[Init] Cores: {self.n_jobs} | Output: {os.path.abspath(self.out_dir)}")
         print(f"[Init] SNR Config (Rx SNR): {SNR_CONFIG}")
-        print(f"[Init] Physics: L_eff={GLOBAL_CONFIG['L_eff'] / 1000:.0f}km, a={GLOBAL_CONFIG['a'] * 100:.0f}cm")
+        print(
+            f"[Init] Physics (Original): L_eff={GLOBAL_CONFIG['L_eff'] / 1000:.0f}km, a={GLOBAL_CONFIG['a'] * 100:.0f}cm")
 
         # 计算衍射深度
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_wb = phy.generate_broadband_chirp(self.t_axis, 32)
         depth = (1 - np.min(np.abs(1.0 - d_wb))) * 100
-        print(f"[Init] Diffraction depth: {depth:.2f}%")
+        print(f"[Init] Diffraction depth: {depth:.4f}%")
 
     def save_plot(self, name):
         """同时保存 PNG 和 PDF"""
@@ -149,7 +150,7 @@ class PaperFigureGenerator:
             print(f"   [Error Saving CSV] {name}: {e}")
 
     # =========================================================================
-    # Group A: Physics Visualization
+    # Group A: Physics Visualization（保持原始逻辑）
     # =========================================================================
 
     def generate_fig2_mechanisms(self):
@@ -311,7 +312,7 @@ class PaperFigureGenerator:
         self.save_plot('Fig11_Trajectory')
 
     # =========================================================================
-    # Group B: Performance
+    # Group B: Performance（修复噪声计算）
     # =========================================================================
 
     def generate_fig6_rmse_sensitivity(self):
@@ -394,7 +395,7 @@ class PaperFigureGenerator:
         phy = DiffractionChannel(GLOBAL_CONFIG)
         d_wb = phy.generate_broadband_chirp(self.t_axis, 32)
 
-        # 【关键】使用正确的 detector 配置
+        # 【修复】使用正确的 detector 配置
         det_ref = TerahertzDebrisDetector(
             self.fs, self.N,
             cutoff_freq=DETECTOR_CONFIG['cutoff_freq'],
@@ -598,7 +599,7 @@ class PaperFigureGenerator:
 
     def run_all(self):
         print("=" * 70)
-        print("SIMULATION START (V7.0 - PHYSICALLY CORRECT)")
+        print("SIMULATION START (V8.0 - ORIGINAL PARAMS + NOISE FIX)")
         print("=" * 70)
 
         # Group A: Physics
@@ -621,7 +622,7 @@ class PaperFigureGenerator:
 
 
 # =========================================================================
-# Worker Functions (Physically Correct)
+# Worker Functions（修复噪声计算）
 # =========================================================================
 
 def _log_envelope(y):
@@ -644,8 +645,7 @@ def _gen_template(v, fs, N, cfg):
 def _trial_rmse_fixed(ibo, jitter_rms, seed, snr_db, sig_truth, N, fs, true_v,
                       hw_base, T_bank, E_bank, v_scan, ideal, P_perp):
     """
-    物理正确的 RMSE 测试函数
-    【关键修改】噪声基于当前信号功率计算
+    【修复】噪声基于当前信号功率计算
     """
     np.random.seed(seed)
 
@@ -659,9 +659,9 @@ def _trial_rmse_fixed(ibo, jitter_rms, seed, snr_db, sig_truth, N, fs, true_v,
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pn = np.exp(1j * hw.generate_phase_noise(N, fs))
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_truth * jit * pn, ibo_dB=ibo)
-        p_ref = np.mean(np.abs(pa_out_raw) ** 2)  # 【关键】基于 PA 输出
+        p_ref = np.mean(np.abs(pa_out_raw) ** 2)  # 【修复】基于 PA 输出
 
-    # 【关键修改】基于当前信号功率计算噪声
+    # 【修复】基于当前信号功率计算噪声
     noise_std = np.sqrt(p_ref / (10 ** (snr_db / 10.0)))
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     rx_signal = pa_out_raw + w
@@ -689,8 +689,7 @@ def _trial_rmse_fixed(ibo, jitter_rms, seed, snr_db, sig_truth, N, fs, true_v,
 def _trial_roc_fixed(sig_clean, seed, snr_db, ideal, s_true_perp, s_energy, P_perp,
                      jitter_val, N, fs):
     """
-    物理正确的 ROC 测试函数
-    【关键修改】噪声基于当前信号功率计算
+    【修复】噪声基于当前信号功率计算
     """
     np.random.seed(seed)
     hw = HardwareImpairments(HW_CONFIG)
@@ -702,9 +701,9 @@ def _trial_roc_fixed(sig_clean, seed, snr_db, ideal, s_true_perp, s_energy, P_pe
         hw.jitter_rms = jitter_val
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_clean * jit, ibo_dB=10.0)
-        p_ref = np.mean(np.abs(pa_out_raw) ** 2)  # 【关键】基于 PA 输出
+        p_ref = np.mean(np.abs(pa_out_raw) ** 2)  # 【修复】基于 PA 输出
 
-    # 【关键修改】基于当前信号功率计算噪声
+    # 【修复】基于当前信号功率计算噪声
     noise_std = np.sqrt(p_ref / (10 ** (snr_db / 10.0)))
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     rx_signal = pa_out_raw + w
@@ -723,8 +722,7 @@ def _trial_roc_fixed(sig_clean, seed, snr_db, ideal, s_true_perp, s_energy, P_pe
 def _trial_mds_fixed(is_h1, sig_clean, seed, snr_db, s_norm, P_perp, N, fs,
                      ideal, jitter_val=0):
     """
-    物理正确的 MDS 测试函数
-    【关键修改】噪声基于当前信号功率计算
+    【修复】噪声基于当前信号功率计算
     """
     np.random.seed(seed)
 
@@ -741,9 +739,9 @@ def _trial_mds_fixed(is_h1, sig_clean, seed, snr_db, s_norm, P_perp, N, fs,
         hw.jitter_rms = jitter_val
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_in * jit, ibo_dB=10.0)
-        p_ref = np.mean(np.abs(pa_out_raw) ** 2)  # 【关键】基于 PA 输出
+        p_ref = np.mean(np.abs(pa_out_raw) ** 2)  # 【修复】基于 PA 输出
 
-    # 【关键修改】基于当前信号功率计算噪声
+    # 【修复】基于当前信号功率计算噪声
     noise_std = np.sqrt(p_ref / (10 ** (snr_db / 10.0)))
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     rx_signal = pa_out_raw + w
@@ -756,8 +754,7 @@ def _trial_mds_fixed(is_h1, sig_clean, seed, snr_db, s_norm, P_perp, N, fs,
 def _trial_isac_fixed(ibo, seed, snr_db, sig_truth, T_bank, E_bank, v_scan,
                       P_perp, N, fs, ideal, jitter_val=0):
     """
-    物理正确的 ISAC 测试函数
-    【关键修改】噪声基于当前信号功率计算
+    【修复】噪声基于当前信号功率计算
     """
     np.random.seed(seed)
     hw = HardwareImpairments(HW_CONFIG)
@@ -770,10 +767,10 @@ def _trial_isac_fixed(ibo, seed, snr_db, sig_truth, T_bank, E_bank, v_scan,
         hw.jitter_rms = jitter_val
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_truth * jit, ibo_dB=ibo)
-        p_ref = np.mean(np.abs(pa_out_raw) ** 2)  # 【关键】基于 PA 输出
+        p_ref = np.mean(np.abs(pa_out_raw) ** 2)  # 【修复】基于 PA 输出
         gamma_eff = 4.0e-3 * (10 ** (-ibo / 10.0))
 
-    # 【关键修改】基于当前信号功率计算噪声
+    # 【修复】基于当前信号功率计算噪声
     noise_std = np.sqrt(p_ref / (10 ** (snr_db / 10.0)))
     w = (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
     rx_signal = pa_out_raw + w

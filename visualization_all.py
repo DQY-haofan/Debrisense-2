@@ -637,12 +637,15 @@ def _trial_roc_fast(sig_clean, seed, noise_std, ideal, s_true_perp, s_energy, P_
     np.random.seed(seed)
     hw = HardwareImpairments(HW_CONFIG)
 
+    # [FIX] 必须在这里定义 N，否则 ideal=True 时 N 未定义会报错
+    N = len(sig_clean)
+
     # 1. 物理层
     if ideal:
         pa_out_raw = sig_clean
     else:
         hw.jitter_rms = jitter_val
-        fs, N = GLOBAL_CONFIG['fs'], len(sig_clean)
+        fs = GLOBAL_CONFIG['fs']
         jit = np.exp(hw.generate_colored_jitter(N, fs))
         # IBO=10dB, 信号有衰减
         pa_out_raw, _, _ = hw.apply_saleh_pa(sig_clean * jit, ibo_dB=10.0)

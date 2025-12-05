@@ -134,7 +134,7 @@ def sweep_fig7_roc():
     s_true = P_perp @ det._generate_template(15000)
     s_eng = np.sum(s_true ** 2) + 1e-20
 
-    snr_list = np.arange(55, 85, 5)
+    snr_list = np.arange(45, 85, 5)
     trials = 100  # ROC 需要稍微多一点
     jit_prop = 1e-5
     jit_std = 2e-4
@@ -241,7 +241,7 @@ def sweep_fig9_isac():
     T_bank = np.array([P_perp @ s for s in s_raw])
     E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
 
-    snr_fixed = 65.0  # 先固定一个 SNR
+    snr_fixed = 50.0  # 先固定一个 SNR
     ibo_list = [0, 5, 10, 15, 20]
 
     print(f"Fixed SNR={snr_fixed} dB")
@@ -265,7 +265,7 @@ def sweep_fig9_isac():
 
 if __name__ == "__main__":
     # 可以选择只运行某一个
-    sweep_fig6_u_shape()
+    # sweep_fig6_u_shape()
     sweep_fig7_roc()
-    sweep_fig8_mds()
-    # sweep_fig9_isac()
+    # sweep_fig8_mds()
+    sweep_fig9_isac()

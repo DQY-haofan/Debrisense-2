@@ -711,19 +711,19 @@ class PaperFigureGenerator:
         print("=" * 70)
 
         # Group A: Physics
-        # self.generate_fig2_mechanisms()
-        # self.generate_fig3_dispersion()
-        # self.generate_fig4_self_healing()
-        # self.generate_fig5_survival_space()
-        # self.generate_fig10_ambiguity()
-        # self.generate_fig11_trajectory()
-
+        self.generate_fig2_mechanisms()
+        self.generate_fig3_dispersion()
+        self.generate_fig4_self_healing()
+        self.generate_fig5_survival_space()
+        self.generate_fig10_ambiguity()
+        self.generate_fig11_trajectory()
+        #
         # Group B: Performance
-        # self.generate_fig6_rmse_sensitivity()
-        # self.generate_fig7_roc()
-        # self.generate_fig8_mds()
+        self.generate_fig6_rmse_sensitivity()
+        self.generate_fig7_roc()
+        self.generate_fig8_mds()
         self.generate_fig13_sensitivity()
-        # self.generate_fig9_isac()
+        self.generate_fig9_isac()
 
         print("\n" + "=" * 70)
         print("ALL TASKS DONE")

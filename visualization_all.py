@@ -708,65 +708,74 @@ class PaperFigureGenerator:
     def generate_fig14_coarse_v_est(self):
         """
         [New] Fig 14: Coarse Velocity Estimation Accuracy (RMSE vs SNR)
-        对比: Ideal, Hardware (Jitter), Theoretical Bound (CRLB)
+        对比: Ideal, Hardware (Fast Jitter), Theoretical Bound (CRLB)
+
+        物理意图：
+        - Ideal: 只有热噪声，估计性能接近 CRLB
+        - Hardware: 在快速幅度抖动 (Scintillation) + PA 非线性下，出现 Error Floor
         """
         print(f"\n--- Fig 14: Coarse Velocity Estimation (RMSE vs SNR) ---")
 
-        # 1. 严格统一的 physics 配置（给 DiffractionChannel 用）
+        # 1. 准备基础物理配置
+        # 注意：这里我们创建一个干净的配置给 Detector 用，去掉 'fs' 防止冲突
         common_cfg = GLOBAL_CONFIG.copy()
-        common_cfg['L_eff'] = GLOBAL_CONFIG['L_eff']
-        common_cfg['a'] = GLOBAL_CONFIG['a']
-        common_cfg['N_sub'] = 32  # 仅用于记录，DiffractionChannel 实际不使用这个 key
 
-        # 2. 准备物理引擎（用于生成真值信号）
-        phy = DiffractionChannel(common_cfg)
-
-        # 3. 准备 detector 的配置（给 TerahertzDebrisDetector / _gen_template 用）
-        #    注意：这里不能包含 'fs'，否则会和位置参数冲突
-        det_cfg = {
+        cfg_for_det = {
             'cutoff_freq': DETECTOR_CONFIG['cutoff_freq'],
             'L_eff': common_cfg['L_eff'],
+            'fc': common_cfg['fc'],
             'a': common_cfg['a'],
-            'N_sub': common_cfg['N_sub'],
-            # 可选：如果你希望和 GLOBAL_CONFIG 完全一致，可以显式传 fc/B
-            # 'fc': common_cfg['fc'],
-            # 'B': common_cfg['B'],
+            'B': common_cfg['B'],
+            'N_sub': 32,  # 显式指定
+            # 关键：这里不要包含 'fs' 或 'T_span'，因为它们作为位置参数传递
         }
 
-        det = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
+        # 2. 物理引擎（用于生成真值信号）
+        phy = DiffractionChannel(common_cfg)
+
+        # 3. 初始化检测器与投影矩阵
+        det = TerahertzDebrisDetector(self.fs, self.N, **cfg_for_det)
         P_perp = det.P_perp
 
-        # 4. 仿真配置
-        fixed_ibo = 10.0
-        fixed_jitter = 5.0e-4
-        snr_scan = np.linspace(0, 60, 13)
+        # 4. 仿真参数配置
+        fixed_ibo = 10.0  # 线性区输入
+        snr_scan = np.linspace(0, 60, 13)  # 扫描范围
+        true_v = 15000.0  # 真值速度
+        trials_per_point = 50  # 每个点的蒙特卡洛次数
 
-        # 5. 生成真值信号 (Ground Truth) - 使用物理引擎的复数输出
-        true_v = 15000.0
+        # ------------------------------------------------------------------
+        # [CRITICAL CONFIG] 制造可见的硬件损伤
+        # ------------------------------------------------------------------
+        # A. 定义高频损伤模型 (Fast Scintillation)
+        HW_CONFIG_FAST = HW_CONFIG.copy()
+        HW_CONFIG_FAST['f_knee'] = 50000.0  # 50kHz: 快速闪烁，AGC 无法消除
 
-        # DiffractionChannel 默认用 config['v_rel']，GLOBAL_CONFIG 没有这个 key，
-        # 所以我们需要显式覆盖
+        # B. 设定足够大的 Jitter RMS
+        fixed_jitter = 2.0e-2  # 2% RMS 幅度抖动
+
+        print(f"   [Config] Hardware Jitter Mode: Fast Scintillation (f_knee={HW_CONFIG_FAST['f_knee']} Hz)")
+        print(f"   [Config] Jitter RMS: {fixed_jitter}")
+
+        # 5. 生成真值信号 (复数基带)
         phy.v_rel = true_v
-
         d_complex = phy.generate_broadband_chirp(self.t_axis, N_sub=32)
-        sig_truth = 1.0 - d_complex  # 复数信号，后续在 _trial_rmse_fixed 里会走 AGC + log-envelope
+        sig_truth = 1.0 - d_complex
 
-        # 6. CRLB 计算（在 P_perp 子空间里）
+        # 6. CRLB 计算（数值微分法）
         delta_v = 1.0
         s_plus = det._generate_template(true_v + delta_v)
         s_minus = det._generate_template(true_v - delta_v)
         ds_dv = P_perp @ (s_plus - s_minus) / (2 * delta_v)
-
-        # 更保险的写法：如果将来 ds_dv 是复数，np.abs 也能正常工作
         crlb_coeff = 1.0 / (np.sqrt(np.sum(np.abs(ds_dv) ** 2)) + 1e-20)
 
-        # 7. 速度搜索空间（高精度）
-        v_scan = np.linspace(true_v - 1000, true_v + 1000, 1001)  # 步长 2 m/s
-        print(f"   Generating templates (Step={v_scan[1] - v_scan[0]:.2f} m/s)...")
+        # 7. 生成搜索模板库 (优化版：步长 10m/s，依赖插值)
+        # 优化：减少搜索点数以降低内存传输开销
+        v_scan = np.linspace(true_v - 1000, true_v + 1000, 201)  # 步长 10m/s
+        print(f"   Generating templates (Step={v_scan[1] - v_scan[0]:.2f} m/s, Points={len(v_scan)})...")
 
-        # 关键修正：这里用 det_cfg，而不是 common_cfg（common_cfg 里有 fs）
+        # [FIX] 使用 clean 的 cfg_for_det，避免传入多余的 fs
         s_raw_list = Parallel(n_jobs=self.n_jobs)(
-            delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan
+            delayed(_gen_template)(v, self.fs, self.N, cfg_for_det) for v in v_scan
         )
         T_bank = np.array([P_perp @ s for s in s_raw_list])
         E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
@@ -776,63 +785,66 @@ class PaperFigureGenerator:
         crlb_curve = []
 
         for snr in tqdm(snr_scan, desc="Scanning SNR"):
-            # A. CRLB：基于理想真值信号的噪声方差
+            # A. CRLB
             p_sig = np.mean(np.abs(sig_truth) ** 2)
             noise_var = p_sig / (10 ** (snr / 10.0))
             crlb_val = crlb_coeff * np.sqrt(noise_var)
             crlb_curve.append(crlb_val)
 
-            # B. Ideal Case（无 jitter / 非线性）
+            # B. Ideal Case (Jitter=0, 使用普通 Config)
             res_id = Parallel(n_jobs=self.n_jobs)(
                 delayed(_trial_rmse_fixed)(
                     fixed_ibo, 0.0, s, snr, sig_truth,
-                    self.N, self.fs, true_v, HW_CONFIG,
+                    self.N, self.fs, true_v,
+                    HW_CONFIG,  # Ideal 传啥 config 都行，反正 jitter=0
                     T_bank, E_bank, v_scan, True, P_perp
                 )
-                for s in range(50)
+                for s in range(trials_per_point)
             )
             res_id = np.array(res_id)
-            valid_id = res_id[np.abs(res_id) < 500]  # 剪掉明显爆炸的 outlier
-            if len(valid_id) > 10:
-                rmse_ideal.append(np.sqrt(np.mean(valid_id ** 2)))
-            else:
-                rmse_ideal.append(100.0)
+            # 剔除极端离群值 (Outliers)
+            valid_id = res_id[np.abs(res_id) < 500]
+            rmse_ideal.append(np.sqrt(np.mean(valid_id ** 2)) if len(valid_id) > 0 else 100.0)
 
-            # C. Hardware Case（含 jitter + PA 非线性）
+            # C. Hardware Case (Fast Jitter, 使用 HW_CONFIG_FAST)
             res_hw = Parallel(n_jobs=self.n_jobs)(
                 delayed(_trial_rmse_fixed)(
                     fixed_ibo, fixed_jitter, s, snr, sig_truth,
-                    self.N, self.fs, true_v, HW_CONFIG,
+                    self.N, self.fs, true_v,
+                    HW_CONFIG_FAST,  # <--- 关键：传入高频损伤配置
                     T_bank, E_bank, v_scan, False, P_perp
                 )
-                for s in range(50)
+                for s in range(trials_per_point)
             )
             res_hw = np.array(res_hw)
             valid_hw = res_hw[np.abs(res_hw) < 500]
-            if len(valid_hw) > 10:
-                rmse_hw.append(np.sqrt(np.mean(valid_hw ** 2)))
-            else:
-                rmse_hw.append(100.0)
+            rmse_hw.append(np.sqrt(np.mean(valid_hw ** 2)) if len(valid_hw) > 0 else 100.0)
 
-        # 8. 保存数据 & 画图
+        # 8. 保存与绘图
         self.save_csv(
-            {'snr': snr_scan, 'rmse_ideal': rmse_ideal,
-             'rmse_hw': rmse_hw, 'crlb': crlb_curve},
+            {
+                'snr': snr_scan,
+                'rmse_ideal': rmse_ideal,
+                'rmse_hw': rmse_hw,
+                'crlb': crlb_curve
+            },
             'Fig14_Coarse_V_Est'
         )
 
         plt.figure(figsize=(5, 4))
-        # 这里最好把 LaTeX 反斜杠转义一下，避免 SyntaxWarning
-        plt.semilogy(snr_scan, rmse_hw, 'r-o', label=f'Hardware ($\\sigma_J$={fixed_jitter})')
+        plt.semilogy(snr_scan, rmse_hw, 'r-o', label=f'Hardware (Fast Jitter, 2%)')
         plt.semilogy(snr_scan, rmse_ideal, 'b--s', label='Ideal')
         plt.semilogy(snr_scan, crlb_curve, 'k:', linewidth=2, label='CRLB')
 
         plt.xlabel('SNR (dB)')
         plt.ylabel('Velocity RMSE (m/s)')
-        plt.title('Velocity Estimation (Complex Signal)')
+        # 加上 Log Scale 的显示优化
+        plt.ylim(bottom=max(min(crlb_curve) * 0.5, 0.01))
+        plt.title('RMSE vs SNR (Coarse Estimation)')
         plt.legend()
-        plt.grid(True, which="both", ls=":")
+        plt.grid(True, which="both", ls=":", alpha=0.5)
         self.save_plot('Fig14_Coarse_V_Est')
+        
 
 
     def generate_fig15_coarse_t_est(self):

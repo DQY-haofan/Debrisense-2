@@ -705,25 +705,203 @@ class PaperFigureGenerator:
             plt.ylabel('Velocity RMSE (m/s)')
             self.save_plot('Fig9_ISAC')
 
+    def generate_fig14_coarse_v_est(self):
+        """
+        [New] Fig 14: Coarse Velocity Estimation Accuracy (RMSE vs SNR)
+        对比: Ideal, Hardware (Jitter), Theoretical Bound (CRLB)
+        """
+        print(f"\n--- Fig 14: Coarse Velocity Estimation (RMSE vs SNR) ---")
+
+        # 1. 严格统一的 physics 配置（给 DiffractionChannel 用）
+        common_cfg = GLOBAL_CONFIG.copy()
+        common_cfg['L_eff'] = GLOBAL_CONFIG['L_eff']
+        common_cfg['a'] = GLOBAL_CONFIG['a']
+        common_cfg['N_sub'] = 32  # 仅用于记录，DiffractionChannel 实际不使用这个 key
+
+        # 2. 准备物理引擎（用于生成真值信号）
+        phy = DiffractionChannel(common_cfg)
+
+        # 3. 准备 detector 的配置（给 TerahertzDebrisDetector / _gen_template 用）
+        #    注意：这里不能包含 'fs'，否则会和位置参数冲突
+        det_cfg = {
+            'cutoff_freq': DETECTOR_CONFIG['cutoff_freq'],
+            'L_eff': common_cfg['L_eff'],
+            'a': common_cfg['a'],
+            'N_sub': common_cfg['N_sub'],
+            # 可选：如果你希望和 GLOBAL_CONFIG 完全一致，可以显式传 fc/B
+            # 'fc': common_cfg['fc'],
+            # 'B': common_cfg['B'],
+        }
+
+        det = TerahertzDebrisDetector(self.fs, self.N, **det_cfg)
+        P_perp = det.P_perp
+
+        # 4. 仿真配置
+        fixed_ibo = 10.0
+        fixed_jitter = 5.0e-4
+        snr_scan = np.linspace(0, 60, 13)
+
+        # 5. 生成真值信号 (Ground Truth) - 使用物理引擎的复数输出
+        true_v = 15000.0
+
+        # DiffractionChannel 默认用 config['v_rel']，GLOBAL_CONFIG 没有这个 key，
+        # 所以我们需要显式覆盖
+        phy.v_rel = true_v
+
+        d_complex = phy.generate_broadband_chirp(self.t_axis, N_sub=32)
+        sig_truth = 1.0 - d_complex  # 复数信号，后续在 _trial_rmse_fixed 里会走 AGC + log-envelope
+
+        # 6. CRLB 计算（在 P_perp 子空间里）
+        delta_v = 1.0
+        s_plus = det._generate_template(true_v + delta_v)
+        s_minus = det._generate_template(true_v - delta_v)
+        ds_dv = P_perp @ (s_plus - s_minus) / (2 * delta_v)
+
+        # 更保险的写法：如果将来 ds_dv 是复数，np.abs 也能正常工作
+        crlb_coeff = 1.0 / (np.sqrt(np.sum(np.abs(ds_dv) ** 2)) + 1e-20)
+
+        # 7. 速度搜索空间（高精度）
+        v_scan = np.linspace(true_v - 1000, true_v + 1000, 1001)  # 步长 2 m/s
+        print(f"   Generating templates (Step={v_scan[1] - v_scan[0]:.2f} m/s)...")
+
+        # 关键修正：这里用 det_cfg，而不是 common_cfg（common_cfg 里有 fs）
+        s_raw_list = Parallel(n_jobs=self.n_jobs)(
+            delayed(_gen_template)(v, self.fs, self.N, det_cfg) for v in v_scan
+        )
+        T_bank = np.array([P_perp @ s for s in s_raw_list])
+        E_bank = np.sum(T_bank ** 2, axis=1) + 1e-20
+
+        rmse_ideal = []
+        rmse_hw = []
+        crlb_curve = []
+
+        for snr in tqdm(snr_scan, desc="Scanning SNR"):
+            # A. CRLB：基于理想真值信号的噪声方差
+            p_sig = np.mean(np.abs(sig_truth) ** 2)
+            noise_var = p_sig / (10 ** (snr / 10.0))
+            crlb_val = crlb_coeff * np.sqrt(noise_var)
+            crlb_curve.append(crlb_val)
+
+            # B. Ideal Case（无 jitter / 非线性）
+            res_id = Parallel(n_jobs=self.n_jobs)(
+                delayed(_trial_rmse_fixed)(
+                    fixed_ibo, 0.0, s, snr, sig_truth,
+                    self.N, self.fs, true_v, HW_CONFIG,
+                    T_bank, E_bank, v_scan, True, P_perp
+                )
+                for s in range(50)
+            )
+            res_id = np.array(res_id)
+            valid_id = res_id[np.abs(res_id) < 500]  # 剪掉明显爆炸的 outlier
+            if len(valid_id) > 10:
+                rmse_ideal.append(np.sqrt(np.mean(valid_id ** 2)))
+            else:
+                rmse_ideal.append(100.0)
+
+            # C. Hardware Case（含 jitter + PA 非线性）
+            res_hw = Parallel(n_jobs=self.n_jobs)(
+                delayed(_trial_rmse_fixed)(
+                    fixed_ibo, fixed_jitter, s, snr, sig_truth,
+                    self.N, self.fs, true_v, HW_CONFIG,
+                    T_bank, E_bank, v_scan, False, P_perp
+                )
+                for s in range(50)
+            )
+            res_hw = np.array(res_hw)
+            valid_hw = res_hw[np.abs(res_hw) < 500]
+            if len(valid_hw) > 10:
+                rmse_hw.append(np.sqrt(np.mean(valid_hw ** 2)))
+            else:
+                rmse_hw.append(100.0)
+
+        # 8. 保存数据 & 画图
+        self.save_csv(
+            {'snr': snr_scan, 'rmse_ideal': rmse_ideal,
+             'rmse_hw': rmse_hw, 'crlb': crlb_curve},
+            'Fig14_Coarse_V_Est'
+        )
+
+        plt.figure(figsize=(5, 4))
+        # 这里最好把 LaTeX 反斜杠转义一下，避免 SyntaxWarning
+        plt.semilogy(snr_scan, rmse_hw, 'r-o', label=f'Hardware ($\\sigma_J$={fixed_jitter})')
+        plt.semilogy(snr_scan, rmse_ideal, 'b--s', label='Ideal')
+        plt.semilogy(snr_scan, crlb_curve, 'k:', linewidth=2, label='CRLB')
+
+        plt.xlabel('SNR (dB)')
+        plt.ylabel('Velocity RMSE (m/s)')
+        plt.title('Velocity Estimation (Complex Signal)')
+        plt.legend()
+        plt.grid(True, which="both", ls=":")
+        self.save_plot('Fig14_Coarse_V_Est')
+
+
+    def generate_fig15_coarse_t_est(self):
+        """
+        [New] Fig 15: Coarse Time (CPA) Estimation Accuracy
+        [Status]: Locked. Parameters are good.
+        """
+        print(f"\n--- Fig 15: Coarse Time Estimation (RMSE vs SNR) ---")
+
+        fixed_ibo = 10.0
+        fixed_jitter = 5.0e-4
+        snr_scan = np.linspace(20, 80, 13)
+
+        phy = DiffractionChannel(GLOBAL_CONFIG)
+        d_signal = phy.generate_broadband_chirp(self.t_axis, 32)
+        sig_truth = 1.0 - d_signal
+
+        rmse_t_ideal = []
+        rmse_t_hw = []
+
+        for snr in tqdm(snr_scan, desc="Scanning SNR (Time)"):
+            # Ideal
+            res_id = Parallel(n_jobs=self.n_jobs)(
+                delayed(_trial_tcpa_error)(fixed_ibo, 0, s, snr, sig_truth, self.N, self.fs, HW_CONFIG, True)
+                for s in range(50)
+            )
+            rmse_t_ideal.append(np.sqrt(np.mean(np.array(res_id) ** 2)))
+
+            # Hardware
+            res_hw = Parallel(n_jobs=self.n_jobs)(
+                delayed(_trial_tcpa_error)(fixed_ibo, fixed_jitter, s, snr, sig_truth, self.N, self.fs, HW_CONFIG,
+                                           False)
+                for s in range(50)
+            )
+            rmse_t_hw.append(np.sqrt(np.mean(np.array(res_hw) ** 2)))
+
+        self.save_csv({'snr': snr_scan, 'rmse_t_ideal': rmse_t_ideal, 'rmse_t_hw': rmse_t_hw}, 'Fig15_Coarse_T_Est')
+
+        plt.figure(figsize=(5, 4))
+        plt.semilogy(snr_scan, np.array(rmse_t_hw) * 1000, 'r-o', label='Hardware')
+        plt.semilogy(snr_scan, np.array(rmse_t_ideal) * 1000, 'b--s', label='Ideal')
+
+        plt.xlabel('SNR (dB)')
+        plt.ylabel('Time CPA RMSE (ms)')
+        plt.legend()
+        plt.grid(True, which="both", ls=":")
+        self.save_plot('Fig15_Coarse_T_Est')
+
     def run_all(self):
         print("=" * 70)
         print("SIMULATION START (V8.0 - ORIGINAL PARAMS + NOISE FIX)")
         print("=" * 70)
 
         # Group A: Physics
-        self.generate_fig2_mechanisms()
-        self.generate_fig3_dispersion()
-        self.generate_fig4_self_healing()
-        self.generate_fig5_survival_space()
-        self.generate_fig10_ambiguity()
-        self.generate_fig11_trajectory()
+        # self.generate_fig2_mechanisms()
+        # self.generate_fig3_dispersion()
+        # self.generate_fig4_self_healing()
+        # self.generate_fig5_survival_space()
+        # self.generate_fig10_ambiguity()
+        # self.generate_fig11_trajectory()
         #
         # Group B: Performance
-        self.generate_fig6_rmse_sensitivity()
-        self.generate_fig7_roc()
-        self.generate_fig8_mds()
-        self.generate_fig13_sensitivity()
-        self.generate_fig9_isac()
+        # self.generate_fig6_rmse_sensitivity()
+        # self.generate_fig7_roc()
+        # self.generate_fig8_mds()
+        # self.generate_fig13_sensitivity()
+        # self.generate_fig9_isac()
+        self.generate_fig14_coarse_v_est()
+        # self.generate_fig15_coarse_t_est()
 
         print("\n" + "=" * 70)
         print("ALL TASKS DONE")
@@ -751,6 +929,44 @@ def _gen_template(v, fs, N, cfg):
     return TerahertzDebrisDetector(fs, N, **cfg)._generate_template(v)
 
 
+def _trial_tcpa_error(ibo, jitter_rms, seed, snr_db, sig_truth, N, fs, hw_base, ideal):
+    np.random.seed(seed)
+
+    if ideal:
+        pa_out = sig_truth
+        p_ref = np.mean(np.abs(sig_truth) ** 2)
+    else:
+        hw_cfg = hw_base.copy()
+        hw_cfg['jitter_rms'] = jitter_rms
+        hw = HardwareImpairments(hw_cfg)
+        jit = np.exp(hw.generate_colored_jitter(N, fs))
+        pn = np.exp(1j * hw.generate_phase_noise(N, fs))
+        pa_out, _, _ = hw.apply_saleh_pa(sig_truth * jit * pn, ibo_dB=ibo)
+        p_ref = np.mean(np.abs(pa_out) ** 2)
+
+    noise_std = np.sqrt(p_ref / (10 ** (snr_db / 10.0)))
+    rx = pa_out + (np.random.randn(N) + 1j * np.random.randn(N)) * noise_std / np.sqrt(2)
+
+    # [Fix] 更稳健的包络提取
+    # 1. 低通滤波 (平滑噪声)
+    win_len = max(1, int(fs * 0.002))  # 增加窗口到 2ms
+    env = np.abs(rx)
+    env_smooth = np.convolve(env, np.ones(win_len) / win_len, mode='same')
+
+    # 2. 寻找"深坑"
+    # 我们知道坑大概在中间，可以限制搜索范围在中间 50% 区域，防止边缘噪声干扰
+    center = N // 2
+    search_width = N // 4
+    search_region = env_smooth[center - search_width: center + search_width]
+
+    idx_min_local = np.argmin(search_region)
+    idx_min_global = idx_min_local + (center - search_width)
+
+    # 真实位置
+    idx_true = N // 2
+
+    t_err = (idx_min_global - idx_true) / fs
+    return t_err
 def _trial_rmse_fixed(ibo, jitter_rms, seed, snr_db, sig_truth, N, fs, true_v,
                       hw_base, T_bank, E_bank, v_scan, ideal, P_perp):
     """

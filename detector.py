@@ -140,6 +140,29 @@ class TerahertzDebrisDetector:
         return P_perp
     
     # =========================================================================
+    # STEP 0: Automatic Gain Control (AGC)
+    # =========================================================================
+    
+    def apply_agc(self, signal_in: np.ndarray) -> np.ndarray:
+        """
+        Apply Automatic Gain Control (AGC).
+        
+        Normalizes signal power to unity, which is critical for
+        consistent detection performance across different signal levels.
+        
+        Args:
+            signal_in: Input signal (complex)
+            
+        Returns:
+            Power-normalized signal
+        """
+        p_sig = np.mean(np.abs(signal_in) ** 2)
+        if p_sig < 1e-20:
+            return signal_in
+        gain = 1.0 / np.sqrt(p_sig)
+        return signal_in * gain
+    
+    # =========================================================================
     # STEP 1: Log-Envelope Transform
     # =========================================================================
     

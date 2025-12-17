@@ -426,8 +426,11 @@ class PaperFigureGenerator:
             noise = (np.random.randn(self.N) + 1j * np.random.randn(self.N)) * noise_std / np.sqrt(2)
             rx = pa_out + noise
             
+            # Apply AGC before log transform (critical for consistent performance)
+            rx_agc = self.detector.apply_agc(rx)
+            
             # Log envelope
-            x = self.detector.log_envelope_transform(rx)
+            x = self.detector.log_envelope_transform(rx_agc)
             z_perp = self.detector.P_perp @ x
             
             # Proposed (GLRT in survival space)
@@ -652,12 +655,13 @@ class PaperFigureGenerator:
         seed = self.get_seed('pd_vs_fcut')
         np.random.seed(seed)
         
-        # Parameters
+        # Parameters - 使用与 fig7 一致的 physics_strict 参数
+        fig_cfg = self.config.figures_config.get('fig7', {})
         f_cut_values = np.array([50, 100, 150, 200, 250, 300, 400, 500])
         target_pfa = 0.01  # Fixed PFA
         mc_trials = 200
-        snr_db = 50.0
-        jitter_sigma = 2.0e-3
+        snr_db = fig_cfg.get('changes', {}).get('snr_db', 75.0)  # Use fig7 SNR
+        jitter_sigma = fig_cfg.get('changes', {}).get('jitter_sigma', 2.0e-3)
         
         print(f"   Target PFA = {target_pfa}, MC trials = {mc_trials}")
         print(f"   SNR = {snr_db} dB, Jitter σ = {jitter_sigma}")
@@ -712,8 +716,11 @@ class PaperFigureGenerator:
                 noise = (np.random.randn(self.N) + 1j * np.random.randn(self.N)) * noise_std / np.sqrt(2)
                 rx = pa_out + noise
                 
+                # Apply AGC before detection
+                rx_agc = detector_i.apply_agc(rx)
+                
                 # Detection statistic
-                x = detector_i.log_envelope_transform(rx)
+                x = detector_i.log_envelope_transform(rx_agc)
                 z_perp = detector_i.P_perp @ x
                 stat = (np.dot(s_proj, z_perp) ** 2) / s_proj_energy
                 h0_stats.append(stat)
@@ -742,8 +749,11 @@ class PaperFigureGenerator:
                 noise = (np.random.randn(self.N) + 1j * np.random.randn(self.N)) * noise_std / np.sqrt(2)
                 rx = pa_out + noise
                 
+                # Apply AGC before detection
+                rx_agc = detector_i.apply_agc(rx)
+                
                 # Detection statistic
-                x = detector_i.log_envelope_transform(rx)
+                x = detector_i.log_envelope_transform(rx_agc)
                 z_perp = detector_i.P_perp @ x
                 stat = (np.dot(s_proj, z_perp) ** 2) / s_proj_energy
                 h1_stats.append(stat)

@@ -1,0 +1,40 @@
+config:
+  B: 10000000000.0
+  L_1MHz: -95.0
+  L_eff: 20000.0
+  L_floor: -120.0
+  N: 4000
+  N_sub: 32
+  T_span: 0.02
+  a: 0.1
+  alpha_a: 10.127
+  alpha_phi: 4.0033
+  beta_a: 5995.0
+  beta_phi: 9.104
+  c: 299792458.0
+  delta_reg: 1.0e-20
+  epsilon_log: 1.0e-12
+  f_corner: 100000.0
+  f_cut: 300.0
+  f_knee: 200.0
+  fc: 300000000000.0
+  fig_settings:
+    changes:
+      jitter_sigma: 0.002
+      snr_db: 55.0
+    description: ROC comparison (Proposed vs Naive vs ED)
+    mc_trials: 500
+  fs: 200000.0
+  jitter_model: log_gain
+  jitter_sigma: 0.002
+  mode: paper
+  pll_bw: 50000.0
+  psd_alpha: 0.5
+  roll_off_order: 8
+  sigma_j: 1.0e-06
+  snr_db: 55.0
+  v_default: 15000.0
+  whitening_enabled: false
+figure: fig7
+run_id: '20251217_202943'
+timestamp: '2025-12-17T20:32:54.245991'

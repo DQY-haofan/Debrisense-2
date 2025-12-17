@@ -1,0 +1,163 @@
+# ==============================================================================
+# THz-ISL Forward Scatter Debris Detection - Demo Baseline Configuration
+# ==============================================================================
+# Version: 1.0
+# Description: Demo mode with enhanced visibility (larger diffraction effect)
+# Usage: Use this for visualization and demonstration purposes
+# Note: These parameters produce clearer plots but are not physically strict
+# ==============================================================================
+
+mode: "demo"  # "demo" for enhanced visibility, "paper" for publication
+
+# ------------------------------------------------------------------------------
+# Physics Parameters
+# ------------------------------------------------------------------------------
+physics:
+  fc: 300.0e9          # Carrier frequency (Hz)
+  B: 10.0e9            # Bandwidth (Hz)
+  c: 299792458.0       # Speed of light (m/s)
+  N_sub: 32            # Number of sub-carriers for DFS
+
+# ------------------------------------------------------------------------------
+# Scenario Parameters (Demo: Larger diffraction effect)
+# ------------------------------------------------------------------------------
+scenario:
+  L_eff: 20.0e3        # Effective link length (m) - 20 km for demo
+  a: 0.10              # Debris radius (m) - 10 cm for demo
+  v_default: 15000.0   # Default relative velocity (m/s)
+
+# ------------------------------------------------------------------------------
+# Sampling Parameters
+# ------------------------------------------------------------------------------
+sampling:
+  fs: 200.0e3          # Sampling frequency (Hz)
+  T_span: 0.02         # Observation window (s)
+  # N = fs * T_span = 4000 samples (computed)
+
+# ------------------------------------------------------------------------------
+# Survival Space / DCT Projection Parameters
+# ------------------------------------------------------------------------------
+survival_space:
+  f_cut: 300.0         # Cutoff frequency for DCT projection (Hz)
+
+# ------------------------------------------------------------------------------
+# Jitter Model Parameters (Log-Gain Jitter)
+# ------------------------------------------------------------------------------
+jitter:
+  model: "log_gain"    # Jitter model type
+  sigma_j: 1.0e-6      # RMS of log-gain jitter (dimensionless)
+  psd_alpha: 0.5       # PSD exponent α
+  f_knee: 200.0        # Knee frequency (Hz)
+  roll_off_order: 8    # Roll-off order p
+
+# ------------------------------------------------------------------------------
+# Noise Configuration
+# ------------------------------------------------------------------------------
+noise:
+  injection_point: "complex_baseband"
+  snr_definition: "signal_power_ratio"
+
+# ------------------------------------------------------------------------------
+# Hardware Impairments
+# ------------------------------------------------------------------------------
+hardware:
+  # Saleh PA Model
+  alpha_a: 10.127
+  beta_a: 5995.0
+  alpha_phi: 4.0033
+  beta_phi: 9.1040
+  
+  # Phase Noise (Leeson Model)
+  L_1MHz: -95.0
+  L_floor: -120.0
+  f_corner: 100.0e3
+  pll_bw: 50.0e3
+
+# ------------------------------------------------------------------------------
+# Detection Parameters
+# ------------------------------------------------------------------------------
+detection:
+  epsilon_log: 1.0e-12
+  delta_regularization: 1.0e-20
+  eta_threshold: 0.01
+  use_agc: true        # Enable AGC for consistent detection
+
+# ------------------------------------------------------------------------------
+# Estimation Parameters
+# ------------------------------------------------------------------------------
+estimation:
+  v_grid_range: [10000.0, 20000.0]
+  v_grid_points: 101
+  t0_grid_range: [-0.003, 0.003]
+  t0_grid_points: 61
+  use_fft_correlation: true
+
+# ------------------------------------------------------------------------------
+# Figure-Specific Overrides (Demo SNR settings)
+# Principle: Each figure changes AT MOST one variable from baseline
+# ------------------------------------------------------------------------------
+figures:
+  fig6:
+    description: "RMSE vs IBO (Velocity estimation)"
+    changes:
+      snr_db: 70.0
+      jitter_sigma: 5.0e-4
+
+  fig7:
+    description: "ROC comparison (Proposed vs Naive vs ED)"
+    changes:
+      snr_db: 50.0           # Lower SNR to show ROC difference
+      jitter_sigma: 2.0e-3   # Moderate jitter for fair comparison
+
+  fig8:
+    description: "MDS vs Jitter"
+    changes:
+      snr_db: 68.0
+      jitter_sigma: 2.0e-3
+
+  fig9:
+    description: "ISAC trade-off"
+    changes:
+      snr_db: 65.0
+      jitter_sigma: 2.0e-3
+
+  fig10:
+    description: "Ambiguity function"
+    changes: {}
+
+  fig13:
+    description: "Sensitivity waterfall (Pd vs SNR)"
+    changes:
+      jitter_sigma: 2.0e-3
+
+  fig14:
+    description: "Coarse velocity estimation"
+    changes:
+      snr_db: 65.0
+      jitter_sigma: 5.0e-4
+
+# ------------------------------------------------------------------------------
+# Sanity Check Configuration
+# ------------------------------------------------------------------------------
+sanity_check:
+  f_cut_sweep: [50, 100, 150, 200, 250, 300, 400, 500, 750, 1000]
+  v_rel_sweep: [10000, 12000, 15000, 18000, 20000]
+  eta_threshold: 0.01
+
+# ------------------------------------------------------------------------------
+# Reproducibility
+# ------------------------------------------------------------------------------
+reproducibility:
+  master_seed: 42
+  mc_trials_default: 500
+  parallel_jobs: -1
+
+# ------------------------------------------------------------------------------
+# Output Configuration
+# ------------------------------------------------------------------------------
+output:
+  paper_id: "thz_isl_demo"
+  export_csv: true
+  export_png: true
+  export_pdf: true
+  config_snapshot: true

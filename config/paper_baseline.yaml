@@ -1,0 +1,217 @@
+# ==============================================================================
+# THz-ISL Forward Scatter Debris Detection - Paper Baseline Configuration
+# ==============================================================================
+# Version: 1.0
+# Description: Single Source of Truth (SSOT) for all paper figures
+# Usage: All parameters must be referenced from this file; no hardcoded values
+# ==============================================================================
+
+mode: "paper"  # "paper" for publication, "debug" for development
+
+# ------------------------------------------------------------------------------
+# Physics Parameters
+# ------------------------------------------------------------------------------
+physics:
+  fc: 300.0e9          # Carrier frequency (Hz)
+  B: 10.0e9            # Bandwidth (Hz)
+  c: 299792458.0       # Speed of light (m/s)
+  N_sub: 32            # Number of sub-carriers for DFS
+
+# ------------------------------------------------------------------------------
+# Scenario Parameters (Near-terminal crossing baseline)
+# ------------------------------------------------------------------------------
+scenario:
+  L_eff: 50.0e3        # Effective link length (m) - 50 km baseline
+  a: 0.05              # Debris radius (m) - 5 cm default
+  v_default: 15000.0   # Default relative velocity (m/s)
+
+# ------------------------------------------------------------------------------
+# Sampling Parameters
+# ------------------------------------------------------------------------------
+sampling:
+  fs: 200.0e3          # Sampling frequency (Hz)
+  T_span: 0.02         # Observation window (s)
+  # N = fs * T_span = 4000 samples (computed)
+
+# ------------------------------------------------------------------------------
+# Survival Space / DCT Projection Parameters
+# ------------------------------------------------------------------------------
+survival_space:
+  f_cut: 300.0         # Cutoff frequency for DCT projection (Hz)
+  # k_max = ceil(f_cut / f_res), where f_res = fs / (2*N)
+
+# ------------------------------------------------------------------------------
+# Jitter Model Parameters (Log-Gain Jitter)
+# ξ_J(t) is dimensionless log-gain jitter
+# PSD: S_J(f) ∝ 1/f^α · 1/(1 + (f/f_knee)^p)
+# ------------------------------------------------------------------------------
+jitter:
+  model: "log_gain"    # Jitter model type
+  sigma_j: 1.0e-6      # RMS of log-gain jitter (dimensionless)
+  psd_alpha: 0.5       # PSD exponent α (baseline, also support α=1.0 for comparison)
+  f_knee: 200.0        # Knee frequency (Hz)
+  roll_off_order: 8    # Roll-off order p
+
+# ------------------------------------------------------------------------------
+# Noise Configuration
+# SNR definition: Signal power at receiver / Noise power
+# Injection point: Complex baseband (noise added before log transform)
+# ------------------------------------------------------------------------------
+noise:
+  injection_point: "complex_baseband"  # Noise added in complex baseband domain
+  snr_definition: "signal_power_ratio" # SNR = P_signal / P_noise
+
+# ------------------------------------------------------------------------------
+# Hardware Impairments
+# ------------------------------------------------------------------------------
+hardware:
+  # Saleh PA Model
+  alpha_a: 10.127
+  beta_a: 5995.0
+  alpha_phi: 4.0033
+  beta_phi: 9.1040
+  
+  # Phase Noise (Leeson Model)
+  L_1MHz: -95.0        # dBc/Hz at 1 MHz offset
+  L_floor: -120.0      # Phase noise floor (dBc/Hz)
+  f_corner: 100.0e3    # 1/f corner frequency (Hz)
+  pll_bw: 50.0e3       # PLL loop bandwidth (Hz)
+
+# ------------------------------------------------------------------------------
+# Detection Parameters
+# ------------------------------------------------------------------------------
+detection:
+  # GLRT Parameters
+  delta_regularization: 1.0e-20  # Prevent division by zero
+  epsilon_log: 1.0e-12           # Prevent log(0)
+  
+  # Whitening (optional)
+  whitening_enabled: false
+  whitening_diagonal_loading: 1.0e-10
+
+# ------------------------------------------------------------------------------
+# Estimation Parameters (2D ML Grid Search for v_rel, t0)
+# ------------------------------------------------------------------------------
+estimation:
+  v_grid_range: [13500.0, 16500.0]   # Velocity search range (m/s)
+  v_grid_points: 61                   # Number of velocity grid points
+  t0_grid_range: [-0.005, 0.005]     # Time offset search range (s)
+  t0_grid_points: 101                 # Number of time grid points
+  use_fft_correlation: true           # Use FFT for fast correlation
+
+# ------------------------------------------------------------------------------
+# Figure-Specific Configurations
+# Each figure only changes ONE independent variable from baseline
+# ------------------------------------------------------------------------------
+figures:
+  fig2:
+    description: "Hardware impairment mechanisms"
+    changes: {}  # Uses baseline
+    
+  fig3:
+    description: "Narrowband vs Wideband dispersion"
+    changes: {}  # Uses baseline
+    
+  fig4:
+    description: "PA self-healing effect"
+    changes: {}  # Uses baseline
+    
+  fig5:
+    description: "Survival space spectrogram"
+    changes: {}  # Uses baseline
+    
+  fig6:
+    description: "RMSE sensitivity vs IBO"
+    changes:
+      snr_db: 70.0               # Fixed SNR for this figure
+    sweep:
+      variable: "ibo_db"
+      range: [0, 30]
+      points: 13
+    jitter_levels: [1.0e-6, 8.0e-3, 1.0e-2, 2.0e-2, 5.0e-2]
+    mc_trials: 100
+    
+  fig7:
+    description: "ROC comparison (Proposed vs Naive vs ED)"
+    changes:
+      snr_db: 50.0
+      jitter_sigma: 2.0e-3       # Fixed colored jitter
+    mc_trials: 1500
+    
+  fig8:
+    description: "MDS (Minimum Detectable Size)"
+    changes:
+      snr_db: 68.0
+      jitter_sigma: 2.0e-3
+    sweep:
+      variable: "debris_diameter_mm"
+      values: [2, 5, 8, 12, 16, 20, 30, 50, 80, 100]
+    mc_trials: 200
+    pfa_target: 0.05
+    
+  fig9:
+    description: "ISAC Capacity-RMSE tradeoff"
+    changes:
+      snr_db: 65.0
+      jitter_sigma: 1.0e-4
+    sweep:
+      variable: "ibo_db"
+      range: [0, 20]
+      points: 15
+    mc_trials: 40
+    
+  fig10:
+    description: "Ambiguity function"
+    changes: {}
+    v_shift_range: [-600, 600]
+    t_shift_range: [-0.0015, 0.0015]
+    grid_points: 41
+    
+  fig13:
+    description: "Sensitivity waterfall (Pd vs SNR)"
+    changes:
+      jitter_sigma: 2.0e-3
+    sweep:
+      variable: "snr_db"
+      range: [30, 70]
+      points: 11
+    pfa_target: 0.01
+    mc_trials_h0: 500
+    mc_trials_h1: 200
+    
+  fig14:
+    description: "Velocity estimation RMSE vs SNR"
+    changes:
+      ibo_db: 10.0
+    sweep:
+      variable: "snr_db"
+      range: [0, 60]
+      points: 13
+    mc_trials: 50
+
+# ------------------------------------------------------------------------------
+# Sanity Check Parameters (Energy Retention Check)
+# ------------------------------------------------------------------------------
+sanity_check:
+  f_cut_sweep: [50, 100, 150, 200, 250, 300, 400, 500, 750, 1000]
+  v_rel_sweep: [10000, 12500, 15000, 17500, 20000]
+  eta_threshold: 0.01  # Minimum acceptable energy retention ratio
+
+# ------------------------------------------------------------------------------
+# Output Configuration
+# ------------------------------------------------------------------------------
+output:
+  base_dir: "outputs"
+  paper_id: "thz_isl_v1"
+  export_formats: ["csv", "png", "pdf"]
+  include_config_snapshot: true
+  include_run_log: true
+  include_git_hash: true
+
+# ------------------------------------------------------------------------------
+# Reproducibility
+# ------------------------------------------------------------------------------
+reproducibility:
+  master_seed: 42
+  numpy_seed_offset: 1000
+  mc_seed_method: "deterministic"  # Seeds derived from master + trial index

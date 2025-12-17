@@ -106,7 +106,7 @@ figures:
   fig7:
     description: "ROC comparison (Proposed vs Naive vs ED)"
     changes:
-      snr_db: 50.0           # Lower SNR to show ROC difference
+      snr_db: 55.0           # Lower SNR to show ROC difference
       jitter_sigma: 2.0e-3   # Moderate jitter for fair comparison
 
   fig8:

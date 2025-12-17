@@ -476,7 +476,7 @@ class PaperFigureGenerator:
             thresholds = np.linspace(np.min(all_stats), np.max(all_stats), 500)
             pfa = np.array([np.mean(h0_stats > th) for th in thresholds])
             pd = np.array([np.mean(h1_stats > th) for th in thresholds])
-            auc = -np.trapz(pd, pfa)
+            auc = -np.trapezoid(pd, pfa)
             return pfa, pd, auc
         
         pfa_prop, pd_prop, auc_prop = get_roc(h0_results[:, 0], h1_results[:, 0])
@@ -673,14 +673,17 @@ class PaperFigureGenerator:
         
         for i, f_cut in enumerate(tqdm(f_cut_values, desc="f_cut sweep")):
             # Create detector with this f_cut
-            det_cfg = self.config.get_detection_config()
-            det_cfg['f_cut'] = f_cut
-            det_cfg['fs'] = self.fs
-            det_cfg['N'] = self.N
-            det_cfg['T_span'] = self.T_span
-            
             from detector import TerahertzDebrisDetector
-            detector_i = TerahertzDebrisDetector(det_cfg, self.N)
+            detector_i = TerahertzDebrisDetector(
+                fs=self.fs,
+                N_window=self.N,
+                cutoff_freq=f_cut,
+                L_eff=self.config.scenario.L_eff,
+                fc=self.config.physics.fc,
+                a=self.config.scenario.a,
+                B=self.config.physics.B,
+                N_sub=self.config.physics.N_sub,
+            )
             
             # Compute energy retention
             s_template = detector_i.generate_template(self.config.scenario.v_default)

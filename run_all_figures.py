@@ -637,6 +637,197 @@ class PaperFigureGenerator:
         self.output.save_run_log('alpha_sensitivity', seed, mc_trials)
     
     # =========================================================================
+    # PD vs f_cut (导师要求的第二张验证图)
+    # =========================================================================
+    
+    def generate_pd_vs_fcut(self):
+        """
+        Generate PD (at fixed PFA) vs f_cut figure.
+        
+        导师要求：这张图与 η vs f_cut 一起，能让审稿人"基本无话可说"。
+        显示在不同 f_cut 下，检测概率如何变化。
+        """
+        print("\n--- PD vs f_cut Analysis ---")
+        
+        seed = self.get_seed('pd_vs_fcut')
+        np.random.seed(seed)
+        
+        # Parameters
+        f_cut_values = np.array([50, 100, 150, 200, 250, 300, 400, 500])
+        target_pfa = 0.01  # Fixed PFA
+        mc_trials = 200
+        snr_db = 50.0
+        jitter_sigma = 2.0e-3
+        
+        print(f"   Target PFA = {target_pfa}, MC trials = {mc_trials}")
+        print(f"   SNR = {snr_db} dB, Jitter σ = {jitter_sigma}")
+        
+        # Generate clean signals
+        d_wb = self.physics.generate_broadband_chirp(self.t_axis, self.config.physics.N_sub)
+        sig_h1 = 1.0 - d_wb
+        sig_h0 = np.ones(self.N, dtype=complex)
+        
+        # Results storage
+        pd_values = np.zeros(len(f_cut_values))
+        eta_values = np.zeros(len(f_cut_values))
+        
+        for i, f_cut in enumerate(tqdm(f_cut_values, desc="f_cut sweep")):
+            # Create detector with this f_cut
+            det_cfg = self.config.get_detection_config()
+            det_cfg['f_cut'] = f_cut
+            det_cfg['fs'] = self.fs
+            det_cfg['N'] = self.N
+            det_cfg['T_span'] = self.T_span
+            
+            from detector import TerahertzDebrisDetector
+            detector_i = TerahertzDebrisDetector(det_cfg, self.N)
+            
+            # Compute energy retention
+            s_template = detector_i.generate_template(self.config.scenario.v_default)
+            eta_values[i] = detector_i.compute_energy_retention(s_template)
+            
+            # Projected template
+            s_proj = detector_i.P_perp @ s_template
+            s_proj_energy = np.sum(s_proj ** 2) + 1e-20
+            
+            # MC trials for H0 (to determine threshold)
+            h0_stats = []
+            for trial in range(mc_trials):
+                trial_seed = seed + i * mc_trials * 2 + trial
+                np.random.seed(trial_seed)
+                
+                # Hardware corruption
+                hw_cfg = self.config.get_hardware_config()
+                hw_cfg['jitter_rms'] = jitter_sigma
+                hw = HardwareImpairments(hw_cfg)
+                jitter = np.exp(hw.generate_colored_jitter(self.N, self.fs))
+                pa_out, _, _ = hw.apply_saleh_pa(sig_h0 * jitter, ibo_dB=10.0)
+                
+                # Add noise
+                p_ref = np.mean(np.abs(pa_out) ** 2)
+                noise_std = np.sqrt(p_ref / (10 ** (snr_db / 10.0)))
+                noise = (np.random.randn(self.N) + 1j * np.random.randn(self.N)) * noise_std / np.sqrt(2)
+                rx = pa_out + noise
+                
+                # Detection statistic
+                x = detector_i.log_envelope_transform(rx)
+                z_perp = detector_i.P_perp @ x
+                stat = (np.dot(s_proj, z_perp) ** 2) / s_proj_energy
+                h0_stats.append(stat)
+            
+            h0_stats = np.array(h0_stats)
+            
+            # Determine threshold for target PFA
+            threshold = np.percentile(h0_stats, 100 * (1 - target_pfa))
+            
+            # MC trials for H1 (to measure PD)
+            h1_stats = []
+            for trial in range(mc_trials):
+                trial_seed = seed + i * mc_trials * 2 + mc_trials + trial
+                np.random.seed(trial_seed)
+                
+                # Hardware corruption
+                hw_cfg = self.config.get_hardware_config()
+                hw_cfg['jitter_rms'] = jitter_sigma
+                hw = HardwareImpairments(hw_cfg)
+                jitter = np.exp(hw.generate_colored_jitter(self.N, self.fs))
+                pa_out, _, _ = hw.apply_saleh_pa(sig_h1 * jitter, ibo_dB=10.0)
+                
+                # Add noise
+                p_ref = np.mean(np.abs(pa_out) ** 2)
+                noise_std = np.sqrt(p_ref / (10 ** (snr_db / 10.0)))
+                noise = (np.random.randn(self.N) + 1j * np.random.randn(self.N)) * noise_std / np.sqrt(2)
+                rx = pa_out + noise
+                
+                # Detection statistic
+                x = detector_i.log_envelope_transform(rx)
+                z_perp = detector_i.P_perp @ x
+                stat = (np.dot(s_proj, z_perp) ** 2) / s_proj_energy
+                h1_stats.append(stat)
+            
+            h1_stats = np.array(h1_stats)
+            pd_values[i] = np.mean(h1_stats > threshold)
+            
+            print(f"   f_cut={f_cut:3d} Hz: η={eta_values[i]:.4f}, PD={pd_values[i]:.3f}")
+        
+        # Save data
+        self.output.save_data('pd_vs_fcut', {
+            'f_cut_hz': f_cut_values,
+            'eta': eta_values,
+            'pd': pd_values,
+            'target_pfa': np.full(len(f_cut_values), target_pfa),
+        })
+        
+        # Plot: Dual y-axis (η and PD vs f_cut)
+        fig, ax1 = plt.subplots(figsize=(6, 4))
+        
+        color1 = 'tab:blue'
+        ax1.set_xlabel('Cutoff Frequency $f_{cut}$ (Hz)')
+        ax1.set_ylabel('Energy Retention $\\eta$', color=color1)
+        ax1.plot(f_cut_values, eta_values, 'o-', color=color1, label='$\\eta$')
+        ax1.tick_params(axis='y', labelcolor=color1)
+        ax1.set_ylim([0, 1.05])
+        
+        ax2 = ax1.twinx()
+        color2 = 'tab:red'
+        ax2.set_ylabel(f'Detection Probability (PFA={target_pfa})', color=color2)
+        ax2.plot(f_cut_values, pd_values, 's--', color=color2, label='$P_D$')
+        ax2.tick_params(axis='y', labelcolor=color2)
+        ax2.set_ylim([0, 1.05])
+        
+        # Mark baseline f_cut
+        baseline_fcut = self.config.survival_space.f_cut
+        ax1.axvline(baseline_fcut, color='green', linestyle=':', alpha=0.7,
+                   label=f'Baseline $f_{{cut}}$={baseline_fcut} Hz')
+        
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+        
+        ax1.grid(True, linestyle=':', alpha=0.5)
+        
+        self.output.save_figure('pd_vs_fcut', fig)
+        self.output.save_config_snapshot('pd_vs_fcut', {
+            'f_cut_values': f_cut_values.tolist(),
+            'target_pfa': target_pfa,
+            'snr_db': snr_db,
+            'jitter_sigma': jitter_sigma,
+            'mc_trials': mc_trials,
+        })
+        self.output.save_run_log('pd_vs_fcut', seed, mc_trials)
+        
+        print(f"\n   Baseline f_cut={baseline_fcut} Hz: η={eta_values[np.argmin(np.abs(f_cut_values - baseline_fcut))]:.4f}")
+    
+    # =========================================================================
+    # Unit Tests Runner (导师要求的验证)
+    # =========================================================================
+    
+    def run_unit_tests(self):
+        """
+        Run estimator unit tests.
+        
+        导师要求的验证项：
+        - SC2: FFT vs direct 一致性
+        - SC3: 负时移对称性  
+        - Toy case 回归
+        """
+        print("\n" + "="*60)
+        print("Running Estimator Unit Tests")
+        print("="*60)
+        
+        from estimator import run_unit_tests
+        results = run_unit_tests(self.detector, verbose=True)
+        
+        # Save results
+        self.output.save_data('unit_tests', {
+            'test_name': list(results.keys()),
+            'passed': [1 if v else 0 for v in results.values()],
+        })
+        
+        return all(results.values())
+    
+    # =========================================================================
     # Run All Figures
     # =========================================================================
     
@@ -661,6 +852,8 @@ class PaperFigureGenerator:
             'fig7': self.generate_fig7_roc,
             'fig10': self.generate_fig10_ambiguity,
             'alpha_sensitivity': self.generate_alpha_sensitivity,
+            'pd_vs_fcut': self.generate_pd_vs_fcut,  # 导师要求的第二张验证图
+            'unit_tests': self.run_unit_tests,       # 导师要求的单元测试
         }
         
         if figures is None:
@@ -696,6 +889,8 @@ def main():
                        help='Specific figures to generate')
     parser.add_argument('--sanity-check', action='store_true',
                        help='Run only sanity check')
+    parser.add_argument('--unit-test', action='store_true',
+                       help='Run estimator unit tests')
     parser.add_argument('--output-dir', default=None,
                        help='Override output directory')
     
@@ -726,6 +921,9 @@ def main():
     # Run
     if args.sanity_check:
         passed = generator.generate_sanity_check()
+        sys.exit(0 if passed else 1)
+    elif args.unit_test:
+        passed = generator.run_unit_tests()
         sys.exit(0 if passed else 1)
     else:
         generator.run_all(figures=args.figures)

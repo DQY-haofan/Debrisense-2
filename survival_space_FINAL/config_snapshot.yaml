@@ -1,0 +1,30 @@
+config:
+  B: 10000000000.0
+  L_eff: 20000.0
+  M_expected: 200
+  T_span: 0.02
+  a: 0.1
+  delta_stat: 1.0e-20
+  eps_log: 1.0e-12
+  f_knee: 200.0
+  fc: 300000000000.0
+  fs: 200000.0
+  ibo_dB: 10.0
+  jitter_rms: 0.002
+  master_seed: 42
+  trials_auc: 500
+  v_default: 15000
+hw_config:
+  L_1MHz: -95.0
+  L_floor: -120.0
+  alpha_a: 10.127
+  beta_a: 5995.0
+  f_knee: 200.0
+  jitter_rms: 1.0e-06
+  pll_bw: 50000.0
+results:
+  auc_at_50dB: 0.9397388888888889
+  f_knee_limit: 559.0169943749473
+  f_max: 1677.050983124842
+  rho_noise_baseline: 0.9907641146248449
+timestamp: '2025-12-17T23:18:46.755794'
